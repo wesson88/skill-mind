@@ -86,17 +86,25 @@ _PROVIDER_ENV_MAP: dict[str, str] = {
 def load_config() -> dict:
     ensure_dirs()
     if CONFIG_FILE.exists():
-        with CONFIG_FILE.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    else:
-        save_config(_DEFAULT_CONFIG)
-        return _DEFAULT_CONFIG.copy()
+        try:
+            with CONFIG_FILE.open("r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if isinstance(data, dict):
+                return data
+            # 文件内容不是 dict（损坏或格式错误），使用默认值
+        except Exception:
+            pass
+    save_config(_DEFAULT_CONFIG)
+    return _DEFAULT_CONFIG.copy()
 
 
 def save_config(cfg: dict) -> None:
+    """原子写 config.yaml，防止崩溃损坏。"""
     ensure_dirs()
-    with CONFIG_FILE.open("w", encoding="utf-8") as f:
+    tmp = CONFIG_FILE.with_suffix(".yaml.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True)
+    tmp.replace(CONFIG_FILE)
 
 
 def get_vault_dir(cfg: dict | None = None) -> Path:
@@ -253,12 +261,15 @@ def _get_claude_code_token() -> str:
 
     # 备用：尝试通过 claude CLI 命令获取（部分版本支持）
     try:
-        result = subprocess.run(
-            ["claude", "auth", "token"],
-            capture_output=True, text=True, timeout=5,
-            # Windows 下隐藏命令窗口
-            creationflags=0x08000000 if sys.platform == "win32" else 0,
-        )
+        # creationflags 只在 Windows 下传入，非 Windows 不支持该参数
+        popen_kwargs: dict = {
+            "capture_output": True,
+            "text": True,
+            "timeout": 5,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        result = subprocess.run(["claude", "auth", "token"], **popen_kwargs)
         token = result.stdout.strip()
         if token and len(token) > 20:
             return token

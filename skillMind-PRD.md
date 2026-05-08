@@ -340,7 +340,6 @@ skillmind config [--show|--test|...]   # 配置管理（Key / 模型 / Vault 路
 - `trace <uuid>` 溯源命令。
 
 ### 🔮 Phase 3：自动化与生态（v3.x）
-- 定时抓取 RSS 更新，自动提取进草稿。
 - 对接 Readwise / Pocket，高亮文章直接进入知识提炼流。
 - watchdog 自动感知 Vault 变更，增量更新向量索引。
 - 发布 v2.0 开源版，附完整中英文文档。

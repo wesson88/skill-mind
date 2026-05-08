@@ -1,4 +1,11 @@
-"""渲染器（Renderer）- 将 JSON 知识单元渲染为 Obsidian Markdown 文件"""
+"""渲染器（Renderer）- 将 JSON 知识单元渲染为 Obsidian Markdown 文件
+
+v2.2 新增：
+  - front matter 增加 doc_type / source_reliability / obsolescence_risk / parent_source
+  - 渲染可靠性与过时风险标注
+  - 一文多卡：显示卡片序号及父文档链接
+  - 所有写入原子化（tmp → replace）
+"""
 
 from __future__ import annotations
 
@@ -21,6 +28,26 @@ def _safe_filename(name: str) -> str:
     return name.strip("-").strip()[:80] or "unnamed"
 
 
+_RELIABILITY_BADGE = {
+    "high":   "🟢 高可信",
+    "medium": "🟡 中等可信",
+    "low":    "🔴 低可信（请交叉验证）",
+}
+
+_OBSOLESCENCE_BADGE = {
+    "low":    "🟢 较稳定",
+    "medium": "🟡 可能过时",
+    "high":   "🔴 高过时风险（请核实版本）",
+}
+
+_DOC_TYPE_LABEL = {
+    "skill":      "📋 Skill",
+    "blog":       "📝 博客",
+    "forum_post": "💬 论坛",
+    "webpage":    "🌐 网页",
+}
+
+
 # ---------------------------------------------------------------------------
 # Markdown 渲染
 # ---------------------------------------------------------------------------
@@ -31,32 +58,62 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
     meta = data.get("meta", {})
     source = data.get("source", {})
     le = data.get("learning_enhancement", {})
+    reliability = data.get("source_reliability", "medium")
+    obsolescence = data.get("obsolescence_risk", "medium")
+    doc_type = source.get("doc_type", data.get("doc_type", "skill"))
 
     # --- YAML front matter ---
+    tags = le.get("knowledge_tags", []) + meta.get("trigger_keywords", [])
     fm: dict = {
         "uuid": data.get("uuid", ""),
         "name": meta.get("name", ""),
         "type": meta.get("type", []),
         "intent": meta.get("intent", ""),
-        "tags": le.get("knowledge_tags", []) + meta.get("trigger_keywords", []),
+        "tags": list(dict.fromkeys(t for t in tags if t)),
+        "doc_type": doc_type,
+        "source_url": source.get("source_url", "") or source.get("repo_url", ""),
         "source_repo": source.get("repo_url", ""),
-        "source_path": source.get("source_path", ""),
+        "source_path": source.get("file_path", "") or source.get("source_path", ""),
         "source_hash": source.get("source_hash", ""),
+        "author": source.get("author", ""),
+        "published_at": source.get("published_at", ""),
+        "source_reliability": reliability,
+        "obsolescence_risk": obsolescence,
+        "parent_source": source.get("parent_source", ""),
         "prompt_version": data.get("prompt_version", ""),
         "status": data.get("status", "published"),
         "draft": data.get("status", "published") != "published",
         "created": data.get("created_at", time.strftime("%Y-%m-%d")),
         "updated": time.strftime("%Y-%m-%d"),
     }
+    # 一文多卡标注
+    card_index = source.get("card_index", 0)
+    card_total = source.get("card_total", 0)
+    if card_total > 1:
+        fm["card_index"] = card_index
+        fm["card_total"] = card_total
 
-    # 去重 tags
-    fm["tags"] = list(dict.fromkeys(t for t in fm["tags"] if t))
+    # 清理空值，减少噪声（注意：False 和 0 是合法值，不过滤）
+    fm = {k: v for k, v in fm.items() if v is not None and v != "" and v != [] and v != {}}
 
     fm_str = yaml.dump(fm, allow_unicode=True, default_flow_style=False).strip()
     lines = [f"---\n{fm_str}\n---\n"]
 
     # --- 标题 ---
-    lines.append(f"# {meta.get('name', 'Untitled')}\n")
+    card_suffix = f"（{card_index}/{card_total}）" if card_total > 1 else ""
+    lines.append(f"# {meta.get('name', 'Untitled')}{card_suffix}\n")
+
+    # --- 来源标注栏（可靠性 & 过时风险）---
+    doc_label = _DOC_TYPE_LABEL.get(doc_type, "📄 文档")
+    rel_badge = _RELIABILITY_BADGE.get(reliability, reliability)
+    obs_badge = _OBSOLESCENCE_BADGE.get(obsolescence, obsolescence)
+    lines.append(
+        f"> {doc_label} &nbsp;|&nbsp; 可信度：{rel_badge} &nbsp;|&nbsp; 时效性：{obs_badge}\n"
+    )
+
+    # --- 一文多卡父文档链接 ---
+    if card_total > 1 and source.get("parent_source"):
+        lines.append(f"> 📎 父文档：[原始来源]({source['parent_source']})\n")
 
     # --- 一句话总结 ---
     if le.get("plain_summary"):
@@ -136,7 +193,7 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             lines.append(f"- {ref}")
         lines.append("")
 
-    # --- 元信息 ---
+    # --- 环境信息 ---
     os_info = meta.get("os", [])
     tools = meta.get("tools_required", [])
     if os_info or tools:
@@ -148,21 +205,38 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
         lines.append("")
 
     # --- 来源 ---
-    repo_url = source.get("repo_url", "")
-    file_path = source.get("file_path", "") or source.get("source_path", "")
-    if repo_url and file_path:
-        # 统一正斜杠，避免 Windows 路径污染 URL
-        file_path_posix = file_path.replace("\\", "/")
-        # 优先用记录的 branch，兜底 main
-        branch = source.get("branch", "main")
-        full_url = f"{repo_url.rstrip('/')}/blob/{branch}/{file_path_posix}"
-        lines.append("---")
-        lines.append(f"*来源：[原始 Skill]({full_url})*")
-    elif repo_url:
-        lines.append("---")
-        lines.append(f"*来源：[原始仓库]({repo_url})*")
+    _render_source_footer(lines, source, doc_type)
 
     return "\n".join(lines)
+
+
+def _render_source_footer(lines: list[str], source: dict, doc_type: str) -> None:
+    """渲染文末原文链接块，支持 Git 仓库和 Web URL 两种模式。"""
+    source_url = source.get("source_url", "")
+    repo_url = source.get("repo_url", "")
+    file_path = source.get("file_path", "") or source.get("source_path", "")
+    author = source.get("author", "")
+    published_at = source.get("published_at", "")
+
+    lines.append("---")
+
+    # Web 文章：直接用 source_url
+    if source_url and doc_type in ("blog", "forum_post", "webpage"):
+        author_str = f"by {author} " if author else ""
+        date_str = f"({published_at})" if published_at else ""
+        lines.append(f"*来源：[原文链接]({source_url}) {author_str}{date_str}*")
+        return
+
+    # Git 仓库：拼接 blob URL
+    if repo_url and file_path:
+        file_path_posix = file_path.replace("\\", "/")
+        branch = source.get("branch", "main")
+        full_url = f"{repo_url.rstrip('/')}/blob/{branch}/{file_path_posix}"
+        lines.append(f"*来源：[原始 Skill]({full_url})*")
+    elif repo_url:
+        lines.append(f"*来源：[原始仓库]({repo_url})*")
+    elif source_url:
+        lines.append(f"*来源：[原文链接]({source_url})*")
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +246,7 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
 def publish_to_vault(data: dict, cfg: dict | None = None) -> Path:
     """
     将知识单元写入 Obsidian Vault，返回写入的文件路径。
+    文件写入原子化（tmp → replace）。
     """
     cfg = cfg or load_config()
     vault_dir = get_vault_dir(cfg)
@@ -182,15 +257,16 @@ def publish_to_vault(data: dict, cfg: dict | None = None) -> Path:
     filename = _safe_filename(meta_name) + ".md"
     dest = published_dir / filename
 
-    # 若文件名冲突，追加 uuid 前缀区分
+    # 文件名冲突时追加 uuid 后缀
     if dest.exists():
         uid_short = data.get("uuid", "")[-7:]
         filename = _safe_filename(meta_name) + f"_{uid_short}.md"
         dest = published_dir / filename
 
     md_content = render_to_markdown(data, cfg)
-    # 原子写：防止崩溃损坏已发布文件
-    tmp = dest.with_suffix(".md.tmp")
+
+    # 原子写：追加 .tmp 后缀（不能用 with_suffix(".md.tmp")，那会把 .md 替换成 .tmp）
+    tmp = dest.parent / (dest.name + ".tmp")
     tmp.write_text(md_content, encoding="utf-8")
     tmp.replace(dest)
     return dest

@@ -64,8 +64,15 @@ def index_vault(console=None) -> int:
     count = 0
 
     def _flush():
-        if ids_batch:
+        if not ids_batch:
+            return
+        try:
             collection.upsert(ids=ids_batch, documents=docs_batch, metadatas=metas_batch)
+        except Exception as e:
+            if console:
+                console.print(f"[yellow]⚠ Chroma upsert 失败（跳过此批）:[/yellow] {e}")
+        finally:
+            # 无论成功失败都清空，防止重复插入
             ids_batch.clear()
             docs_batch.clear()
             metas_batch.clear()
@@ -110,9 +117,20 @@ def _extract_searchable_text(md_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def semantic_search(query: str, top_k: int = 5) -> list[dict]:
-    """在 Chroma 中执行语义搜索，返回结果列表。"""
+    """在 Chroma 中执行语义搜索，返回结果列表。集合为空时安全返回 []。"""
     collection = _get_chroma_collection()
-    results = collection.query(query_texts=[query], n_results=top_k)
+    try:
+        count = collection.count()
+    except Exception:
+        count = 0
+    if count == 0:
+        return []
+    # 确保 n_results 不超过实际文档数，避免部分 chromadb 版本抛异常
+    n = min(top_k, count)
+    try:
+        results = collection.query(query_texts=[query], n_results=n)
+    except Exception:
+        return []
     output = []
     ids = results.get("ids", [[]])[0]
     docs = results.get("documents", [[]])[0]

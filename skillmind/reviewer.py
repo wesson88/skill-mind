@@ -32,12 +32,15 @@ def list_drafts(status: str | None = None) -> list[dict]:
 
 
 def get_draft(uid: str) -> dict | None:
-    """根据 uuid 获取草稿（支持前缀匹配）。"""
+    """根据 uuid 获取草稿（支持前缀匹配）。损坏文件跳过，不崩溃。"""
     ensure_dirs()
     for f in DRAFTS_DIR.glob("*.json"):
         if f.stem == uid or f.stem.startswith(uid):
-            with f.open("r", encoding="utf-8") as fp:
-                return json.load(fp)
+            try:
+                with f.open("r", encoding="utf-8") as fp:
+                    return json.load(fp)
+            except (json.JSONDecodeError, OSError):
+                return None
     return None
 
 
@@ -93,11 +96,16 @@ def open_in_editor(uid: str) -> bool:
     try:
         subprocess.call(editor.split() + [str(draft_file)])
     except FileNotFoundError:
-        # 编辑器不存在时，降级用 os.startfile（Windows）或 xdg-open
-        if sys.platform == "win32":
-            os.startfile(str(draft_file))
-        else:
-            subprocess.call(["xdg-open", str(draft_file)])
+        # 编辑器不存在时降级
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(draft_file))  # type: ignore[attr-defined]
+            else:
+                subprocess.call(["xdg-open", str(draft_file)])
+        except Exception:
+            pass
+    except Exception:
+        pass
     return True
 
 

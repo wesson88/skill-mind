@@ -48,7 +48,9 @@ def split_front_matter(text: str) -> tuple[dict, str]:
     m = _FM_RE.match(text)
     if m:
         try:
-            fm = yaml.safe_load(m.group(1)) or {}
+            loaded = yaml.safe_load(m.group(1))
+            # safe_load 可能返回 str/int 等非 dict 类型（如 YAML 只有一个标量）
+            fm = loaded if isinstance(loaded, dict) else {}
         except yaml.YAMLError:
             fm = {}
         body = text[m.end():]
