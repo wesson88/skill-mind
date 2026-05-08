@@ -74,10 +74,8 @@ _SECTION_KEYWORDS: dict[str, list[str]] = {
         "procedure", "steps", "process", "instructions", "usage", "workflow", "how to",
         "流程", "步骤", "操作", "使用", "执行", "实现", "方法", "指南", "实施", "操作方法",
     ],
-    "decisions": [
-        "decision", "when to use", "conditions", "if", "strategy",
-        "决策", "条件", "何时", "选择", "策略", "判断", "方向",
-    ],
+    # 注意：preconditions / halt_conditions / rollback 必须放在 decisions 前面，
+    # 否则 "前置条件" / "中止条件" / "回滚条件" 会被 decisions 的 "条件" 子串先抢走。
     "preconditions": [
         "preconditions", "prerequisites", "requirements", "setup", "before",
         "前提", "前置条件", "要求", "准备", "依赖", "环境",
@@ -89,6 +87,10 @@ _SECTION_KEYWORDS: dict[str, list[str]] = {
     "rollback": [
         "rollback", "revert", "undo", "fallback",
         "回滚", "撤销", "恢复", "降级",
+    ],
+    "decisions": [
+        "decision", "when to use", "conditions", "if", "strategy",
+        "决策", "条件", "何时", "选择", "策略", "判断", "方向",
     ],
     "examples": [
         "example", "sample", "demo", "case",
