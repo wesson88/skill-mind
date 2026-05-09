@@ -251,6 +251,10 @@ def _llm_extract(
         .replace("{content}", text)
     )
 
+    # 净化潜在的 surrogate / 半码字符：parser 兜底解码可能引入这些，litellm 内部
+    # encode("utf-8") 严格模式会抛 UnicodeEncodeError，错误地耗掉一次重试配额。
+    user_prompt = user_prompt.encode("utf-8", errors="replace").decode("utf-8")
+
     timeout = int(cfg.get("llm", {}).get("timeout", 120))
     max_retries = int(cfg.get("llm", {}).get("max_retries", 2))
 
@@ -468,7 +472,8 @@ def _assemble_draft(
         "raw_path": source_info.get("raw_path", ""),
         "author": source_info.get("author", ""),
         "published_at": source_info.get("published_at", ""),
-        "branch": "main",
+        # 优先用 collector 探测到的实际分支；旧条目缺失时 main 兜底
+        "branch": source_info.get("branch") or "main",
     }
 
     if total > 1:

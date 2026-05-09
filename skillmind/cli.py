@@ -10,6 +10,18 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Windows 控制台默认 codepage（cp936/cp437）无法编码 emoji 与多数 CJK 之外字符，
+# 会让 rich/typer 渲染 --help 时直接 UnicodeEncodeError 退出。
+# 必须在导入 typer/rich 前 reconfigure，否则它们会在 import 时缓存原 stdout。
+if sys.platform == "win32":
+    for _stream_name in ("stdout", "stderr"):
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None:
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError):
+                pass
+
 import typer
 from rich.console import Console
 from rich.panel import Panel

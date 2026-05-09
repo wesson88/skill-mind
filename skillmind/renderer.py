@@ -23,9 +23,34 @@ from skillmind.config import get_vault_dir, load_config
 # 工具函数
 # ---------------------------------------------------------------------------
 
+# Windows 保留名（不区分大小写），即便加扩展名也不能用作文件名
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
 def _safe_filename(name: str) -> str:
+    """生成跨平台安全的文件名（不含扩展名）。"""
+    # 1. 替换 Windows 非法字符
     name = re.sub(r'[\\/:*?"<>|]', "-", name)
-    return name.strip("-").strip()[:80] or "unnamed"
+    # 2. 删除 ASCII 控制字符（含 \x00-\x1F 与 DEL）
+    name = "".join(c for c in name if ord(c) >= 0x20 and c != "\x7f")
+    # 3. 修剪
+    name = name.strip("-").strip()[:80] or "unnamed"
+    # 4. Windows 保留名兜底（CON / PRN / NUL / COM1...）
+    stem = name.split(".", 1)[0]
+    if stem.upper() in _WIN_RESERVED:
+        name = f"_{name}"
+    return name
+
+
+def _max_backticks_run(text: str) -> int:
+    """文本中最长的连续反引号数，用于动态选择代码围栏宽度。"""
+    return max((len(m.group()) for m in _BACKTICK_RUN_RE.finditer(text)), default=0)
 
 
 _RELIABILITY_BADGE = {
@@ -147,9 +172,14 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             command = step.get("command", "")
             if command:
                 lines.append(f"{seq}. {action}")
-                lines.append(f"   ```")
-                lines.append(f"   {command}")
-                lines.append(f"   ```")
+                # 动态选围栏宽度：至少 3 个反引号，且严格大于 command 中
+                # 最长连续反引号数，确保不被内容串中的 ``` 提前闭合。
+                fence = "`" * max(3, _max_backticks_run(command) + 1)
+                lines.append(f"   {fence}")
+                # 多行命令逐行缩进，单行也走这个分支（splitlines 至少 1 行）
+                for cmd_line in (command.splitlines() or [""]):
+                    lines.append(f"   {cmd_line}")
+                lines.append(f"   {fence}")
             else:
                 lines.append(f"{seq}. {action}")
         lines.append("")
@@ -230,7 +260,8 @@ def _render_source_footer(lines: list[str], source: dict, doc_type: str) -> None
     # Git 仓库：拼接 blob URL
     if repo_url and file_path:
         file_path_posix = file_path.replace("\\", "/")
-        branch = source.get("branch", "main")
+        # 优先用 collector 探测到的分支；缺失时 main 兜底
+        branch = source.get("branch") or "main"
         full_url = f"{repo_url.rstrip('/')}/blob/{branch}/{file_path_posix}"
         lines.append(f"*来源：[原始 Skill]({full_url})*")
     elif repo_url:
@@ -254,14 +285,18 @@ def publish_to_vault(data: dict, cfg: dict | None = None) -> Path:
     published_dir.mkdir(parents=True, exist_ok=True)
 
     meta_name = data.get("meta", {}).get("name", data.get("uuid", "unnamed"))
-    filename = _safe_filename(meta_name) + ".md"
-    dest = published_dir / filename
+    base = _safe_filename(meta_name)
+    dest = published_dir / f"{base}.md"
 
-    # 文件名冲突时追加 uuid 后缀
+    # 文件名冲突时追加完整 uuid（不截前 7 位，避免空 uuid 导致 "_.md"）；
+    # 仍冲突再追加序号，循环兜底，绝不静默覆盖。
     if dest.exists():
-        uid_short = data.get("uuid", "")[-7:]
-        filename = _safe_filename(meta_name) + f"_{uid_short}.md"
-        dest = published_dir / filename
+        uid = _safe_filename(data.get("uuid", "") or "anon")
+        dest = published_dir / f"{base}_{uid}.md"
+        n = 2
+        while dest.exists():
+            dest = published_dir / f"{base}_{uid}_{n}.md"
+            n += 1
 
     md_content = render_to_markdown(data, cfg)
 

@@ -138,8 +138,12 @@ def _parse_github_url(url: str) -> tuple[str, str | None]:
     return repo_root_url, None
 
 
-def clone_or_pull(repo_url: str) -> Path:
-    """克隆（首次）或拉取（已存在）远端仓库，返回本地路径。"""
+def clone_or_pull(repo_url: str) -> tuple[Path, str]:
+    """克隆（首次）或拉取（已存在）远端仓库。
+
+    返回 (local_path, default_branch)。
+    clone 失败时清理半克隆目录，避免下次进入 "exists" 分支拿到损坏 repo。
+    """
     try:
         import git as gitpython  # type: ignore
     except ImportError:
@@ -156,16 +160,39 @@ def clone_or_pull(repo_url: str) -> Path:
             # 网络中断、合并冲突等：保留本地缓存，不崩溃
             import warnings
             warnings.warn(f"Git pull 失败，使用本地缓存: {e}", stacklevel=2)
+            repo = gitpython.Repo(local_path)
     else:
-        gitpython.Repo.clone_from(repo_url, local_path, depth=1)
+        try:
+            gitpython.Repo.clone_from(repo_url, local_path, depth=1)
+        except Exception:
+            # 半 clone 目录会污染下次调用，必须彻底清理
+            shutil.rmtree(local_path, ignore_errors=True)
+            raise
+        repo = gitpython.Repo(local_path)
 
-    return local_path
+    return local_path, _detect_default_branch(repo)
+
+
+def _detect_default_branch(repo) -> str:
+    """优先取 active_branch；detached HEAD 时降级 main/master。"""
+    try:
+        return repo.active_branch.name
+    except Exception:
+        try:
+            ref_names = {r.name.split("/")[-1] for r in repo.refs}
+            for fallback in ("main", "master"):
+                if fallback in ref_names:
+                    return fallback
+        except Exception:
+            pass
+    return "main"
 
 
 def _get_commit_sha(repo_path: Path) -> str | None:
+    """读取 commit sha。允许从 repo 子目录定位 .git。"""
     try:
         import git as gitpython  # type: ignore
-        repo = gitpython.Repo(repo_path)
+        repo = gitpython.Repo(repo_path, search_parent_directories=True)
         return repo.head.commit.hexsha[:8]
     except Exception:
         return None
@@ -251,7 +278,7 @@ def ingest_skill(source: str, console=None) -> list[dict]:
                 console.print(f"[dim]仅扫描子目录:[/dim] {subdir}")
         if console:
             console.print(f"[cyan]克隆仓库:[/cyan] {clone_url}")
-        base_dir = clone_or_pull(clone_url)
+        base_dir, branch = clone_or_pull(clone_url)
         source_repo = source  # 保留原始 URL，便于 trace 还原
         commit_sha = _get_commit_sha(base_dir)
         if subdir:
@@ -267,6 +294,7 @@ def ingest_skill(source: str, console=None) -> list[dict]:
             raise FileNotFoundError(f"路径不存在: {base_dir}")
         source_repo = str(base_dir)
         commit_sha = None
+        branch = ""  # 本地路径无分支概念
 
     skill_files = list(scan_local(base_dir))
     if console:
@@ -290,6 +318,7 @@ def ingest_skill(source: str, console=None) -> list[dict]:
                 "source_repo": source_repo,
                 "source_path": rel_path,
                 "commit_sha": commit_sha,
+                "branch": branch,
                 "fetch_time": time.time(),
                 "raw_path": str(raw_dest),
             }
@@ -315,6 +344,7 @@ def ingest_skill(source: str, console=None) -> list[dict]:
             "source_repo": source_repo,
             "source_hash": sha,
             "commit_sha": commit_sha,
+            "branch": hashes[sha].get("branch", branch),
             "fetch_time": hashes[sha].get("fetch_time", 0.0),
             "doc_type": "skill",
             "skipped": skipped,
