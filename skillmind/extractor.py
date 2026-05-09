@@ -79,33 +79,33 @@ _USER_PROMPT_TEMPLATE = """【任务】
 否则返回单个 JSON 对象。
 
 【字段定义】
-{{
-  "meta": {{
+{
+  "meta": {
     "name": "笔记标题（简洁，<= 30 字）",
     "type": ["command-oriented" | "concept-explanation" | "decision-tree" | "troubleshooting"],
     "intent": "一句话目的描述",
     "trigger_keywords": ["关键词", "..."],
     "os": ["linux", "macos", "..."],
     "tools_required": ["工具名", "..."]
-  }},
+  },
   "preconditions": ["前置条件", "..."],
   "procedure": [
-    {{"seq": 1, "action": "动作描述", "command": "可选命令"}}
+    {"seq": 1, "action": "动作描述", "command": "可选命令"}
   ],
   "decision_points": [
-    {{"condition": "判断条件", "then": "成立时", "else": "不成立时"}}
+    {"condition": "判断条件", "then": "成立时", "else": "不成立时"}
   ],
   "halt_conditions": ["停止条件", "..."],
   "rollback_actions": ["回滚动作", "..."],
   "cross_references": ["[[关联笔记名]]", "..."],
-  "learning_enhancement": {{
+  "learning_enhancement": {
     "pain_points": ["难点 / 避坑", "..."],
     "plain_summary": "白话一句话总结",
     "knowledge_tags": ["标签", "..."]
-  }},
+  },
   "source_reliability": "high | medium | low",
   "obsolescence_risk": "low | medium | high"
-}}
+}
 
 【可信度判断】
 - high   : 官方文档、知名团队的 Skill 仓库
@@ -240,12 +240,15 @@ def _llm_extract(
         "published_at": source_info.get("published_at", ""),
     }
 
-    user_prompt = _USER_PROMPT_TEMPLATE.format(
-        doc_type_label=_DOC_TYPE_LABEL.get(doc_type, "文档"),
-        focus_rules=_FOCUS_RULES.get(doc_type, _FOCUS_RULES["webpage"]),
-        metadata_json=json.dumps(metadata, ensure_ascii=False),
-        doc_type=doc_type,
-        content=text,
+    # 注意：不能用 str.format()，文档正文 text 可能含 { } （代码/JSON/Shell），
+    # 会导致 KeyError / ValueError。改用手动字符串替换，安全无副作用。
+    user_prompt = (
+        _USER_PROMPT_TEMPLATE
+        .replace("{doc_type_label}", _DOC_TYPE_LABEL.get(doc_type, "文档"))
+        .replace("{focus_rules}", _FOCUS_RULES.get(doc_type, _FOCUS_RULES["webpage"]))
+        .replace("{metadata_json}", json.dumps(metadata, ensure_ascii=False))
+        .replace("{doc_type}", doc_type)
+        .replace("{content}", text)
     )
 
     timeout = int(cfg.get("llm", {}).get("timeout", 120))
@@ -292,12 +295,15 @@ def _llm_call_once(creds: dict, user_prompt: str, *, timeout: int) -> list[dict]
     return _parse_json_response(raw)
 
 
-_CODEBLOCK_RE = re.compile(r"```(?:json|JSON)?\s*\n(.*?)```", re.DOTALL)
+_CODEBLOCK_RE = re.compile(r"```(?:json|JSON)?\s*\n([\s\S]{1,30000}?)```")
 
 
 def _parse_json_response(text: str) -> list[dict]:
-    """剥离可能的 ``` 包裹，解析为 list[dict]。"""
+    """剥离可能的 ``` 包裹，解析为 list[dict]。防回溯：限制匹配长度上限。"""
     text = text.strip()
+    # 截断超长响应，防止正则回溯地狱（LLM 偶尔返回超大文本）
+    if len(text) > 32000:
+        text = text[:32000]
     # 1. 整体被 ``` 包裹
     m = _CODEBLOCK_RE.search(text)
     if m:

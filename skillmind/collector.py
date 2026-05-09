@@ -149,8 +149,13 @@ def clone_or_pull(repo_url: str) -> Path:
     local_path = REPOS_DIR / slug
 
     if local_path.exists():
-        repo = gitpython.Repo(local_path)
-        repo.remotes.origin.pull()
+        try:
+            repo = gitpython.Repo(local_path)
+            repo.remotes.origin.pull()
+        except Exception as e:
+            # 网络中断、合并冲突等：保留本地缓存，不崩溃
+            import warnings
+            warnings.warn(f"Git pull 失败，使用本地缓存: {e}", stacklevel=2)
     else:
         gitpython.Repo.clone_from(repo_url, local_path, depth=1)
 
@@ -292,9 +297,11 @@ def ingest_skill(source: str, console=None) -> list[dict]:
             if console:
                 console.print(f"  [green]✓[/green] 已缓存: {rel_path}")
         else:
-            raw_dest = Path(hashes[sha]["raw_path"])
+            # 兼容旧条目：raw_path 字段可能缺失
+            raw_dest = Path(hashes[sha].get("raw_path") or str(RAW_DIR / sha[:2] / f"{sha}.md"))
             if not raw_dest.exists():
                 _safe_copy(skill_file, raw_dest)
+                hashes[sha]["raw_path"] = str(raw_dest)
                 hashes_dirty = True
                 if console:
                     console.print(f"  [yellow]⚠ 缓存文件丢失，已重新复制:[/yellow] {rel_path}")
@@ -311,6 +318,10 @@ def ingest_skill(source: str, console=None) -> list[dict]:
             "fetch_time": hashes[sha].get("fetch_time", 0.0),
             "doc_type": "skill",
             "skipped": skipped,
+            "title": hashes[sha].get("title", ""),
+            "author": hashes[sha].get("author", ""),
+            "published_at": hashes[sha].get("published_at", ""),
+            "source_url": hashes[sha].get("source_url", ""),
         })
 
     if hashes_dirty:

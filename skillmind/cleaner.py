@@ -115,7 +115,11 @@ def _try_httpx(url: str, timeout: int) -> Optional[tuple[str, dict]]:
     try:
         resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
         resp.raise_for_status()
-        html = resp.text
+        # 防止超大页面撑爆内存（限制 8 MB）
+        if len(resp.content) > 8 * 1024 * 1024:
+            html = resp.text[:8 * 1024 * 1024]
+        else:
+            html = resp.text
     except Exception:
         return None
 
@@ -138,8 +142,8 @@ def _try_httpx(url: str, timeout: int) -> Optional[tuple[str, dict]]:
 
 _NOISE_TAGS = re.compile(
     r"<(script|style|nav|header|footer|aside|form|iframe|noscript|svg)"
-    r"[^>]*>.*?</\1>",
-    re.DOTALL | re.IGNORECASE,
+    r"[^>]*>[\s\S]{0,50000}?</\1>",
+    re.IGNORECASE,
 )
 _HTML_TAGS = re.compile(r"<[^>]+>")
 _MULTI_BLANK = re.compile(r"\n{3,}")
