@@ -93,6 +93,8 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
         "uuid": data.get("uuid", ""),
         "name": meta.get("name", ""),
         "type": meta.get("type", []),
+        # W2.4：内容形态轴。procedure/decision/concept 任一；空串则不写入（cleanup 会过滤）
+        "focus_mode": meta.get("focus_mode", ""),
         "intent": meta.get("intent", ""),
         "tags": list(dict.fromkeys(t for t in tags if t)),
         "doc_type": doc_type,

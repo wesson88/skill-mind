@@ -1,21 +1,26 @@
-"""提取引擎（Extractor）v2.3 (W1)
+"""提取引擎（Extractor）v2.4
 
 职责：将单个已缓存的原始文档转成 1~N 张结构化草稿（一文多卡）。
 
-设计要点（与 PRD §4.4 一致）：
-- 动态 Prompt 路由：按 doc_type 选择提取重点。
+设计要点：
 - 一文多卡：LLM 可返回 JSON 数组，每项渲染为独立笔记。
 - 可信度 / 过时风险：source_reliability / obsolescence_risk 由 LLM 标注。
 - 提取缓存：同 (source_hash, prompt_version) 命中直接复用，避免重复消费 Token。
 - 凭证缺失（resolve_llm_credentials 抛出）属配置错误，向上抛，不静默降级。
 
-W1 新增（与 W1 计划对应）：
-- chunker 接入：原文先切分再拼回（带 <<CHUNK N>> 标记），预算从 6K 提到 30K
-- LLM 输出 JSON Schema 校验（jsonschema 已是依赖）
-- 两层重试机制：
-  * transport 层（超时/连接错误）→ 指数退避 max_retries 次（原行为）
-  * 内容层（JSON 解析/schema 校验失败）→ retry-with-feedback 一次（新增）
-- 全部失败后仍走启发式 _heuristic_extract 兜底。
+W2.4 改动 —— 分类轴重构：
+- 旧版按 doc_type（skill/blog/forum/webpage）路由所有 stage 的 focus
+- 新版区分两条轴：
+  * doc_type = 容器标识（来源是哪种载体）→ 仅 identity / enhancement 用
+  * focus_mode = 内容形态（procedure / decision / concept）→ 由 identity stage 按卡判断
+    structure stage 按每张卡的 focus_mode 应用对应规则
+- 目的：GitHub 仓库里 SKILL.md / prompt / agent / README 不再被一刀切成"skill"
+  形态，每张卡按自身内容选合适的结构提取规则。
+
+继承自前几波（保留）：
+- chunker 接入：原文带 <<CHUNK N>> 标记送入 LLM，预算 30K 字符
+- 每 stage 独立 JSON Schema 校验 + retry-with-feedback 一次
+- LLM 全失败仍走 _heuristic_extract 兜底
 """
 
 from __future__ import annotations
@@ -44,23 +49,38 @@ from skillmind.reviewer import save_draft
 # ---------------------------------------------------------------------------
 
 _DOC_TYPE_LABEL = {
-    "skill":      "Claude Code Skill 文档",
+    # W2.4：skill 容器现在涵盖 GitHub 仓库中的多种文档（SKILL.md / prompt / agent / README 等），
+    # 不再特指 Claude Code Skill。形态由 focus_mode（procedure/decision/concept）按卡决定。
+    "skill":      "Git 仓库内的知识文档（SKILL.md / 提示词 / agent 定义 / README / 教程等）",
     "blog":       "技术博客文章",
     "forum_post": "论坛主题帖（含问答）",
     "webpage":    "通用网页",
 }
 
+# focus_mode：W2.4 新增"内容形态"轴，由 identity stage 按卡判断
+# structure stage 按 focus_mode 选择对应的结构提取规则
+_FOCUS_MODE_ENUM = ["procedure", "decision", "concept"]
+
+# 各 focus_mode 的判断标准（写入 identity 提示词，让 LLM 自行选择）
+_FOCUS_MODE_HINTS = """- procedure ：步骤型 / 命令型。原文有"先做 A，再做 B"的可复现流程、命令片段、配置示例。
+              典型：how-to 教程、SKILL.md 执行流程、安装文档。
+- decision  ：判断型 / 分支型。原文有多条件、多方案对比、选型 tradeoff、故障排查分支。
+              典型：故障排查贴、架构选型博客、prompt 设计文档、"X vs Y"对比文章。
+- concept   ：解释型 / 知识型。原文主要说明 what / why，没有显式步骤或决策分支。
+              典型：概念解释博客、agent 角色定义、prompt 库说明、术语 glossary。"""
+
 # ---------------------------------------------------------------------------
-# 3 阶段 prompt 系统（W2.1）
+# 3 阶段 prompt 系统（W2.1 引入，W2.4 重构分类轴）
 #
-# Stage 1 identity:    doc → cards 身份信息（name/type/intent/keywords）
-# Stage 2 structure:   doc + cards → 每张卡的骨架（procedure/decisions/halt/rollback/preconds/refs）
+# Stage 1 identity:    doc → cards 身份信息 + 每卡的 focus_mode（形态判定）
+# Stage 2 structure:   doc + cards → 每张卡的骨架，按各自 focus_mode 应用对应规则
 # Stage 3 enhancement: doc + cards + structure → 每张卡的加值信息（summary/tags/reliability/risk）
 #
 # 设计原则：
-# - 每 stage 独立 LLM 调用，独立 schema，独立 retry-with-feedback（复用 W1）
-# - 阶段间数据流：identity 输出作为 structure/enhancement 的上下文（hybrid B 模式）
-# - 多卡决定权在 identity 阶段，后续阶段输出 N 个 units 按序对齐
+# - 每 stage 独立 LLM 调用，独立 schema，独立 retry-with-feedback
+# - identity 决定卡数与每卡的 focus_mode；后续阶段按 card_index 对齐
+# - identity / enhancement 阶段仍按 doc_type 路由（容器层规则）
+# - structure 阶段在单次调用内枚举 3 套 focus 规则，LLM 按每张卡的 focus_mode 自选
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
@@ -69,26 +89,32 @@ _SYSTEM_PROMPT = (
     "重要：直接输出 JSON，不要附带任何解释、不要使用 Markdown 代码块包裹。"
 )
 
-# Focus rules: stage × doc_type 二维路由
+# identity / enhancement focus rules（按 doc_type 容器层）
 _STAGE_FOCUS_RULES: dict[str, dict[str, str]] = {
     "identity": {
-        "skill": "- 文档是已经过提炼的 Skill，请忠实保留其 name 风格；type 偏 command-oriented / decision-tree。",
+        "skill": "- 来源是 Git 仓库内文档，可能是执行手册、提示词、agent 配置、README、教程。"
+                 "  请按主题/可独立成卡的子结构判断卡数，不要因为是仓库就强行单卡。",
         "blog":  "- 若长文涵盖多个独立主题（如「全栈 DevOps 指南」含 CI/CD、监控、部署），按主题拆成多张卡。",
         "forum_post": "- 主帖问题为主卡；若不同回答属于明显不同方案/不同适用场景，可拆多卡。",
         "webpage": "- 通常单卡；除非页面明显是分主题汇总（如 awesome 列表），否则不要拆。",
     },
-    "structure": {
-        "skill": "- 严格保留作者写明的执行流程顺序、命令片段、前置条件、halt 条件、回滚动作。",
-        "blog":  "- 提取核心步骤；命令片段必须从原文照搬，不要泛化；缺失某节就留空数组。",
-        "forum_post": "- 主帖问题描述写 preconditions；多个回答方案对比写入 decision_points；最终采纳方案写 procedure。",
-        "webpage": "- 若文中含可执行命令则一并提取到 procedure，否则 procedure 留空。",
-    },
     "enhancement": {
-        "skill": "- 可信度通常 high；过时风险按是否涉及具体版本号判断。pain_points 保留作者明确写的避坑。",
+        "skill": "- 来源是 Git 仓库：官方维护项目 high / 活跃社区项目 medium / 个人零散仓库 low。"
+                 "  过时风险按是否涉及具体版本号判断；pain_points 保留作者明确写的避坑。",
         "blog":  "- 可信度依作者/站点判断（个人博客 low / 大型站点 medium / 官方 high）；过时风险偏 medium。",
         "forum_post": "- 可信度通常 low（个人回答）；除非明显官方/高赞被采纳；过时风险 medium-high。",
         "webpage": "- 按内容类型判断；概念解释 obsolescence_risk=low，版本相关 high。",
     },
+}
+
+# structure focus rules（按 focus_mode 内容形态层，W2.4 新轴）
+_STRUCTURE_FOCUS_RULES: dict[str, str] = {
+    "procedure": "严格保留执行流程顺序与命令片段；preconditions / halt_conditions / rollback_actions 按原文摘出；"
+                 "decision_points 通常为空。命令片段必须从原文照搬，不要泛化。",
+    "decision":  "重点抽取 decision_points（多条件 / 多方案对比 / 选型 tradeoff），condition+then+else 完整成对；"
+                 "procedure 写最终采纳方案的步骤；preconditions 写共同前置；halt 写「应当放弃此路线」的条件。",
+    "concept":   "preconditions / procedure / halt_conditions / rollback_actions 通常为空（除非原文有显式步骤）；"
+                 "cross_references 优先：把关联术语 / 相关概念写成 [[wiki]] 引用；不要为了凑结构强行造步骤。",
 }
 
 
@@ -100,6 +126,12 @@ _STAGE_IDENTITY_PROMPT = """【阶段】身份识别（identity）
 判断以下{doc_type_label}应拆成几张知识卡，并给每张卡输出身份字段。
 不要在本阶段输出 procedure / decision_points / 等结构字段，那是下一阶段的任务。
 
+【关键判断：每张卡的 focus_mode】
+按内容形态从三类中选一种，决定下一阶段如何抽取结构：
+{focus_mode_hints}
+
+一份文档内不同卡可以是不同 focus_mode（例如一个仓库里同时有教程类卡和概念类卡）。
+
 【阶段聚焦】
 {focus_rules}
 
@@ -109,6 +141,7 @@ _STAGE_IDENTITY_PROMPT = """【阶段】身份识别（identity）
     {
       "name": "笔记标题（简洁，<= 30 字）",
       "type": ["command-oriented" | "concept-explanation" | "decision-tree" | "troubleshooting"],
+      "focus_mode": "procedure | decision | concept",
       "intent": "一句话目的描述",
       "trigger_keywords": ["关键词", "..."],
       "os": ["linux", "macos", "..."],
@@ -116,6 +149,11 @@ _STAGE_IDENTITY_PROMPT = """【阶段】身份识别（identity）
     }
   ]
 }
+
+注意：focus_mode 必填且单选；type 是辅助标签可多选。两者关系参考但不强绑：
+- 单纯 command-oriented 通常对应 focus_mode=procedure
+- decision-tree / troubleshooting 通常对应 focus_mode=decision
+- concept-explanation 通常对应 focus_mode=concept
 
 【文档元信息】
 {metadata_json}
@@ -137,8 +175,13 @@ _STAGE_STRUCTURE_PROMPT = """【阶段】结构骨架（structure）
 基于前一阶段已确定的卡片身份，为每张卡提取结构化骨架字段。
 卡片数量、顺序、name 严格对齐 cards_context；不要新增/删除/重排卡片。
 
-【阶段聚焦】
-{focus_rules}
+【关键：按每张卡的 focus_mode 应用对应规则】
+cards_context 中每张卡都标了 focus_mode，请逐张套用下面对应的规则。
+同一份文档内不同卡可以采用不同规则。
+
+[procedure 规则] {focus_procedure}
+[decision  规则] {focus_decision}
+[concept   规则] {focus_concept}
 
 【前一阶段输出（cards_context）】
 {cards_json}
@@ -161,7 +204,7 @@ _STAGE_STRUCTURE_PROMPT = """【阶段】结构骨架（structure）
   ]
 }
 
-units 数组顺序必须与 cards_context 一一对应。某字段在原文中不存在时保留为空数组。
+units 数组顺序必须与 cards_context 一一对应。某字段在原文中不存在或按 focus_mode 规则不适用时保留为空数组。
 
 【文档元信息】
 {metadata_json}
@@ -481,21 +524,44 @@ def _build_stage_prompt(
     metadata: dict,
     prev_context: dict,
 ) -> str:
-    """组装某 stage 的 user_prompt，做手动字符串替换以避免 str.format 与正文 { } 冲突。"""
+    """组装某 stage 的 user_prompt，做手动字符串替换以避免 str.format 与正文 { } 冲突。
+
+    W2.4 路由：
+      - identity:    {focus_rules} 仍按 doc_type；额外注入 {focus_mode_hints}
+      - structure:   注入 3 个独立 focus 规则 {focus_procedure/decision/concept}，
+                     LLM 按 cards_context 里每张卡的 focus_mode 自选
+      - enhancement: {focus_rules} 按 doc_type
+    """
     template = _STAGE_PROMPTS[stage]
-    focus_rules = _STAGE_FOCUS_RULES.get(stage, {}).get(
-        doc_type,
-        _STAGE_FOCUS_RULES.get(stage, {}).get("webpage", ""),
-    )
 
     p = (
         template
         .replace("{doc_type_label}", _DOC_TYPE_LABEL.get(doc_type, "文档"))
-        .replace("{focus_rules}", focus_rules)
         .replace("{metadata_json}", json.dumps(metadata, ensure_ascii=False))
         .replace("{doc_type}", doc_type)
         .replace("{content}", text)
     )
+
+    # identity / enhancement: 单一 focus_rules 占位（按 doc_type）
+    if "{focus_rules}" in p:
+        focus_rules = _STAGE_FOCUS_RULES.get(stage, {}).get(
+            doc_type,
+            _STAGE_FOCUS_RULES.get(stage, {}).get("webpage", ""),
+        )
+        p = p.replace("{focus_rules}", focus_rules)
+
+    # identity 特有：focus_mode 判定标准
+    if "{focus_mode_hints}" in p:
+        p = p.replace("{focus_mode_hints}", _FOCUS_MODE_HINTS)
+
+    # structure 特有：3 套 focus 规则按 focus_mode 自选
+    if stage == "structure":
+        p = (
+            p
+            .replace("{focus_procedure}", _STRUCTURE_FOCUS_RULES["procedure"])
+            .replace("{focus_decision}", _STRUCTURE_FOCUS_RULES["decision"])
+            .replace("{focus_concept}", _STRUCTURE_FOCUS_RULES["concept"])
+        )
 
     if "{cards_json}" in p:
         cards_brief = [
@@ -503,6 +569,8 @@ def _build_stage_prompt(
                 "name": c.get("name", ""),
                 "intent": c.get("intent", ""),
                 "type": c.get("type") or [],
+                # W2.4：把 focus_mode 暴露给 structure / enhancement
+                "focus_mode": c.get("focus_mode", "concept"),
             }
             for c in prev_context.get("cards", [])
         ]
@@ -532,6 +600,8 @@ def _merge_stage_outputs(
             "meta": {
                 "name": card.get("name", ""),
                 "type": card.get("type") or [],
+                # W2.4：focus_mode 留在 meta 里，供 renderer / 下游消费
+                "focus_mode": card.get("focus_mode", "concept"),
                 "intent": card.get("intent", ""),
                 "trigger_keywords": card.get("trigger_keywords") or [],
                 "os": card.get("os") or [],
@@ -621,7 +691,8 @@ _TYPE_ENUM = [
 _RELIABILITY_ENUM = ["high", "medium", "low"]
 
 
-# Stage 1: identity → {"cards": [{name, type, intent, ...}, ...]}
+# Stage 1: identity → {"cards": [{name, type, focus_mode, intent, ...}, ...]}
+# W2.4：focus_mode required + enum，作为后续 structure 阶段的形态路由依据
 _IDENTITY_SCHEMA: dict = {
     "type": "object",
     "required": ["cards"],
@@ -631,13 +702,14 @@ _IDENTITY_SCHEMA: dict = {
             "minItems": 1,
             "items": {
                 "type": "object",
-                "required": ["name"],
+                "required": ["name", "focus_mode"],
                 "properties": {
                     "name": {"type": "string", "minLength": 1, "maxLength": 80},
                     "type": {
                         "type": "array",
                         "items": {"type": "string", "enum": _TYPE_ENUM},
                     },
+                    "focus_mode": {"type": "string", "enum": _FOCUS_MODE_ENUM},
                     "intent": {"type": "string"},
                     "trigger_keywords": {"type": "array", "items": {"type": "string"}},
                     "os": {"type": "array", "items": {"type": "string"}},
@@ -856,10 +928,19 @@ def _heuristic_extract(text: str, raw_path: Path, source_info: dict) -> dict:
     if decision_points:
         types.append("decision-tree")
 
+    # W2.4：启发式兜底也要给出 focus_mode（避免下游消费者拿到默认空）
+    if decision_points:
+        focus_mode = "decision"
+    elif procedure:
+        focus_mode = "procedure"
+    else:
+        focus_mode = "concept"
+
     return {
         "meta": {
             "name": title[:60],
             "type": list(dict.fromkeys(types)),
+            "focus_mode": focus_mode,
             "intent": title[:80],
             "trigger_keywords": [],
             "os": [],
