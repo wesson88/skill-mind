@@ -53,6 +53,15 @@ def _max_backticks_run(text: str) -> int:
     return max((len(m.group()) for m in _BACKTICK_RUN_RE.finditer(text)), default=0)
 
 
+def _format_evidence_tag(source_quote: str, chunk_id) -> str:
+    """W2.2：构造原文证据标注（inline dim 短语）。无证据时返回空串。"""
+    if not source_quote:
+        return ""
+    # source_quote 转义：用反引号包住短引文以避免与 Markdown 链接 [] 冲突
+    chunk_hint = f", chunk {chunk_id}" if isinstance(chunk_id, int) and chunk_id >= 0 else ""
+    return f' <sub>≪原文: `{source_quote.strip()}`{chunk_hint}≫</sub>'
+
+
 _RELIABILITY_BADGE = {
     "high":   "🟢 高可信",
     "medium": "🟡 中等可信",
@@ -172,18 +181,19 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             seq = step.get("seq", "")
             action = step.get("action", "")
             command = step.get("command", "")
+            # W2.2 evidence：若有 source_quote/chunk_id 则附短引文
+            quote = step.get("source_quote", "")
+            chunk_id = step.get("chunk_id")
+            quote_tag = _format_evidence_tag(quote, chunk_id)
             if command:
-                lines.append(f"{seq}. {action}")
-                # 动态选围栏宽度：至少 3 个反引号，且严格大于 command 中
-                # 最长连续反引号数，确保不被内容串中的 ``` 提前闭合。
+                lines.append(f"{seq}. {action}{quote_tag}")
                 fence = "`" * max(3, _max_backticks_run(command) + 1)
                 lines.append(f"   {fence}")
-                # 多行命令逐行缩进，单行也走这个分支（splitlines 至少 1 行）
                 for cmd_line in (command.splitlines() or [""]):
                     lines.append(f"   {cmd_line}")
                 lines.append(f"   {fence}")
             else:
-                lines.append(f"{seq}. {action}")
+                lines.append(f"{seq}. {action}{quote_tag}")
         lines.append("")
 
     # --- 关键决策 ---
@@ -194,7 +204,8 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             condition = dp.get("condition", "")
             then = dp.get("then", "")
             else_ = dp.get("else", "")
-            lines.append(f"- **{condition}**")
+            quote_tag = _format_evidence_tag(dp.get("source_quote", ""), dp.get("chunk_id"))
+            lines.append(f"- **{condition}**{quote_tag}")
             if then:
                 lines.append(f"  - ✅ 是：{then}")
             if else_:
@@ -222,7 +233,13 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
     if cross_references:
         lines.append("## 🔗 关联知识")
         for ref in cross_references:
-            lines.append(f"- {ref}")
+            # W2.2：cross_references 可能是 str 或 {ref, source_quote, chunk_id}
+            if isinstance(ref, dict):
+                ref_text = ref.get("ref", "")
+                quote_tag = _format_evidence_tag(ref.get("source_quote", ""), ref.get("chunk_id"))
+                lines.append(f"- {ref_text}{quote_tag}")
+            else:
+                lines.append(f"- {ref}")
         lines.append("")
 
     # --- 环境信息 ---

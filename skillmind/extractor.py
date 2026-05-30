@@ -1,23 +1,25 @@
-"""提取引擎（Extractor）v2.4
+"""提取引擎（Extractor）v2.5
 
 职责：将单个已缓存的原始文档转成 1~N 张结构化草稿（一文多卡）。
 
-设计要点：
-- 一文多卡：LLM 可返回 JSON 数组，每项渲染为独立笔记。
-- 可信度 / 过时风险：source_reliability / obsolescence_risk 由 LLM 标注。
-- 提取缓存：同 (source_hash, prompt_version) 命中直接复用，避免重复消费 Token。
-- 凭证缺失（resolve_llm_credentials 抛出）属配置错误，向上抛，不静默降级。
+W2.2 新增 —— evidence 阶段（第 4 个 stage）：
+- 为前三个阶段产出的 procedure 步 / decision 分支 / cross_references 标注：
+  * source_quote：原文中能字面找到的短引文（≤60 字符）
+  * chunk_id：引文所在的 <<CHUNK N>> 编号
+- 关键副作用：找不到证据的 cross_references **直接丢弃**（破除 LLM 凭空编造 wiki 链接的幻觉）
+- 配置开关：extract.enable_evidence（默认 true）；关闭时跳过该阶段，行为退化为 v2.4
 
 W2.4 改动 —— 分类轴重构：
-- 旧版按 doc_type（skill/blog/forum/webpage）路由所有 stage 的 focus
-- 新版区分两条轴：
-  * doc_type = 容器标识（来源是哪种载体）→ 仅 identity / enhancement 用
-  * focus_mode = 内容形态（procedure / decision / concept）→ 由 identity stage 按卡判断
-    structure stage 按每张卡的 focus_mode 应用对应规则
-- 目的：GitHub 仓库里 SKILL.md / prompt / agent / README 不再被一刀切成"skill"
-  形态，每张卡按自身内容选合适的结构提取规则。
+- 两条独立的轴：
+  * doc_type = 容器标识 → 仅 identity / enhancement 用
+  * focus_mode = 内容形态（procedure / decision / concept）→ 按卡判断，驱动 structure
+- 目的：GitHub 仓库里 SKILL.md / prompt / agent / README 不再被一刀切成"skill" 形态
 
 继承自前几波（保留）：
+- 一文多卡：LLM 可返回 JSON 数组，每项渲染为独立笔记
+- 可信度 / 过时风险：source_reliability / obsolescence_risk 由 LLM 标注
+- 阶段级提取缓存：同 (source_hash, prompt_version, stage) 命中直接复用
+- 凭证缺失（resolve_llm_credentials 抛出）属配置错误，向上抛，不静默降级
 - chunker 接入：原文带 <<CHUNK N>> 标记送入 LLM，预算 30K 字符
 - 每 stage 独立 JSON Schema 校验 + retry-with-feedback 一次
 - LLM 全失败仍走 _heuristic_extract 兜底
@@ -263,13 +265,60 @@ units 数组顺序必须与 cards_context 一一对应。
 请直接输出 JSON。"""
 
 
+# ── Stage 4: evidence（W2.2，原文证据回填）────────────────────────────────
+
+_STAGE_EVIDENCE_PROMPT = """【阶段】原文证据回填（evidence）
+
+【任务】
+前面三个阶段已确定 procedure / decision_points / cross_references。本阶段为每一项标注：
+- source_quote：原文中**能字面找到**的连续短引文（≤60 字符，约 30 个汉字），证明该项来自原文
+- chunk_id：该引文所在的 <<CHUNK N>> 编号
+
+【关键约束】
+1. source_quote 必须是原文出现的连续字符串，不要改写、不要总结、不要翻译。
+2. ≤60 字符硬限制；选最能支撑该项的关键词或短语即可，不需要完整句子。
+3. **如果某项在原文中找不到对应支撑（说明上一阶段是 LLM 编造的），就不要为它输出 evidence 条目。** 留空是允许的，是甄别幻觉的关键。
+4. cross_ref_evidence 的 ref 必须与 cards_with_structure 中给出的字符串完全一致（包括 [[ ]] 包裹）。
+
+【字段定义】
+{
+  "units": [
+    {
+      "procedure_evidence": [
+        {"seq": 1, "source_quote": "spawn all runs in same turn", "chunk_id": 5}
+      ],
+      "decision_evidence": [
+        {"index": 0, "source_quote": "Claude.ai: no subagents", "chunk_id": 9}
+      ],
+      "cross_ref_evidence": [
+        {"ref": "[[agents/grader.md]]", "source_quote": "agents/grader.md", "chunk_id": 7}
+      ]
+    }
+  ]
+}
+
+units 顺序与 cards_with_structure 严格对齐。各 evidence 数组在找不到对应支撑时留空（数组为 []）。
+
+【前三阶段输出 cards_with_structure】
+{cards_with_structure_json}
+
+【文档元信息】
+{metadata_json}
+
+【文档正文（doc_type={doc_type}）】
+{content}
+
+请直接输出 JSON。"""
+
+
 _STAGE_PROMPTS: dict[str, str] = {
     "identity":    _STAGE_IDENTITY_PROMPT,
     "structure":   _STAGE_STRUCTURE_PROMPT,
     "enhancement": _STAGE_ENHANCEMENT_PROMPT,
+    "evidence":    _STAGE_EVIDENCE_PROMPT,
 }
 
-_STAGE_ORDER: tuple[str, ...] = ("identity", "structure", "enhancement")
+_STAGE_ORDER: tuple[str, ...] = ("identity", "structure", "enhancement", "evidence")
 
 
 # ---------------------------------------------------------------------------
@@ -344,12 +393,13 @@ def _llm_extract(
     cfg: dict,
     console=None,
 ) -> list[dict]:
-    """3 阶段编排（W2.1）：
+    """4 阶段编排（W2.1 → W2.2）：
 
     1. chunker 切分 + 拼回带 <<CHUNK N>> 标记的字符串（送给所有 stage 共用）
-    2. identity → structure → enhancement 顺序执行
+    2. identity → structure → enhancement → evidence 顺序执行
     3. 每 stage 独立缓存（key 含 stage 名）+ 独立 retry-with-feedback
-    4. 按 card_index 合并 3 阶段输出为 list[unit]
+    4. 按 card_index 合并前 3 阶段输出 → 第 4 阶段 evidence 回填到合并结果
+    5. evidence 阶段可经 extract.enable_evidence 关闭
     """
     try:
         creds = resolve_llm_credentials(cfg)
@@ -441,8 +491,34 @@ def _llm_extract(
     )
     enh_units = enhancement.get("units") or []
 
-    # 5. 合并
-    return _merge_stage_outputs(cards, struct_units, enh_units)
+    # 5. 合并前 3 阶段
+    units = _merge_stage_outputs(cards, struct_units, enh_units)
+
+    # 6. Stage 4: evidence（W2.2，可选）
+    if cfg.get("extract", {}).get("enable_evidence", True):
+        try:
+            evidence = _run_or_load_stage(
+                stage="evidence",
+                source_hash=source_hash,
+                prompt_version=prompt_version,
+                text=text_for_llm,
+                doc_type=doc_type,
+                metadata=metadata,
+                prev_context={"cards": cards, "structure": struct_units},
+                creds=creds,
+                cfg=cfg,
+                console=console,
+            )
+            ev_units = evidence.get("units") or []
+            units = _apply_evidence(units, ev_units, console=console)
+        except Exception as e:
+            # evidence 阶段失败不阻塞主流程，保留前 3 阶段输出
+            if console:
+                console.print(f"  [yellow]⚠ evidence 阶段失败，跳过证据回填:[/yellow] {e}")
+    elif console:
+        console.print(f"  [dim]evidence: 已关闭（extract.enable_evidence=false）[/dim]")
+
+    return units
 
 
 def _run_or_load_stage(
@@ -579,8 +655,112 @@ def _build_stage_prompt(
             json.dumps(cards_brief, ensure_ascii=False, indent=2),
         )
 
+    # evidence 阶段特有：构造含 procedure/decision/cross_refs 的丰富上下文
+    if "{cards_with_structure_json}" in p:
+        cards = prev_context.get("cards", []) or []
+        structs = prev_context.get("structure", []) or []
+        rich: list[dict] = []
+        for i, c in enumerate(cards):
+            s = structs[i] if i < len(structs) else {}
+            rich.append({
+                "name": c.get("name", ""),
+                "focus_mode": c.get("focus_mode", ""),
+                "procedure": [
+                    {"seq": step.get("seq"), "action": (step.get("action") or "")[:120]}
+                    for step in (s.get("procedure") or [])
+                ],
+                "decision_points": [
+                    {"index": idx, "condition": (dp.get("condition") or "")[:80]}
+                    for idx, dp in enumerate(s.get("decision_points") or [])
+                ],
+                "cross_references": s.get("cross_references") or [],
+            })
+        p = p.replace(
+            "{cards_with_structure_json}",
+            json.dumps(rich, ensure_ascii=False, indent=2),
+        )
+
     # 净化潜在的 surrogate / 半码字符（litellm 严格模式下会触发 UnicodeEncodeError）
     return p.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _apply_evidence(
+    units: list[dict],
+    evidence_units: list[dict],
+    *,
+    console=None,
+) -> list[dict]:
+    """W2.2：把 evidence 阶段输出合并进已 merge 完的 units。
+
+    - procedure: 按 seq 匹配，添加 source_quote / chunk_id
+    - decision_points: 按 index 匹配，添加 source_quote / chunk_id
+    - cross_references: 由 str 列表升级为 dict 列表 {ref, source_quote, chunk_id}；
+      没有 evidence 支撑的引用 **直接丢弃**（破除幻觉链接）
+
+    返回原地修改后的 units（同一对象引用）。
+    """
+    dropped_refs = 0
+    annotated_steps = 0
+    for i, unit in enumerate(units):
+        if i >= len(evidence_units):
+            break
+        ev = evidence_units[i] or {}
+
+        # procedure: by seq
+        proc_map: dict[int, dict] = {}
+        for e in ev.get("procedure_evidence", []) or []:
+            if isinstance(e, dict) and isinstance(e.get("seq"), int):
+                proc_map[e["seq"]] = e
+        for step in unit.get("procedure", []) or []:
+            seq = step.get("seq")
+            if seq in proc_map:
+                step["source_quote"] = proc_map[seq].get("source_quote", "")
+                step["chunk_id"] = proc_map[seq].get("chunk_id", -1)
+                annotated_steps += 1
+
+        # decision_points: by index
+        dec_map: dict[int, dict] = {}
+        for e in ev.get("decision_evidence", []) or []:
+            if isinstance(e, dict) and isinstance(e.get("index"), int):
+                dec_map[e["index"]] = e
+        for idx, dp in enumerate(unit.get("decision_points", []) or []):
+            if idx in dec_map:
+                dp["source_quote"] = dec_map[idx].get("source_quote", "")
+                dp["chunk_id"] = dec_map[idx].get("chunk_id", -1)
+                annotated_steps += 1
+
+        # cross_references: keep only those with evidence
+        cref_map: dict[str, dict] = {}
+        for e in ev.get("cross_ref_evidence", []) or []:
+            if isinstance(e, dict) and isinstance(e.get("ref"), str):
+                cref_map[e["ref"]] = e
+        original_refs = unit.get("cross_references", []) or []
+        new_refs: list = []
+        for ref in original_refs:
+            if isinstance(ref, str):
+                if ref in cref_map:
+                    new_refs.append({
+                        "ref": ref,
+                        "source_quote": cref_map[ref].get("source_quote", ""),
+                        "chunk_id": cref_map[ref].get("chunk_id", -1),
+                    })
+                else:
+                    dropped_refs += 1
+            elif isinstance(ref, dict):  # 罕见兼容路径
+                if ref.get("ref") in cref_map:
+                    ref["source_quote"] = cref_map[ref["ref"]].get("source_quote", "")
+                    ref["chunk_id"] = cref_map[ref["ref"]].get("chunk_id", -1)
+                    new_refs.append(ref)
+                else:
+                    dropped_refs += 1
+        unit["cross_references"] = new_refs
+
+    if console:
+        console.print(
+            f"  [cyan]evidence:[/cyan] 回填 {annotated_steps} 项；"
+            f"丢弃无证据的 cross_references {dropped_refs} 条"
+        )
+    return units
 
 
 def _merge_stage_outputs(
@@ -802,10 +982,71 @@ _ENHANCEMENT_SCHEMA: dict = {
 }
 
 
+# Stage 4: evidence → {"units": [{procedure_evidence/decision_evidence/cross_ref_evidence: [...]}, ...]}
+# W2.2：所有 evidence 数组可为空（找不到原文证据时留空是允许的）
+_EVIDENCE_SCHEMA: dict = {
+    "type": "object",
+    "required": ["units"],
+    "properties": {
+        "units": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "procedure_evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["seq", "source_quote", "chunk_id"],
+                            "properties": {
+                                "seq": {"type": "integer"},
+                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 60},
+                                "chunk_id": {"type": "integer", "minimum": 0},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "decision_evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["index", "source_quote", "chunk_id"],
+                            "properties": {
+                                "index": {"type": "integer", "minimum": 0},
+                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 60},
+                                "chunk_id": {"type": "integer", "minimum": 0},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "cross_ref_evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["ref", "source_quote", "chunk_id"],
+                            "properties": {
+                                "ref": {"type": "string", "minLength": 1},
+                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 60},
+                                "chunk_id": {"type": "integer", "minimum": 0},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                },
+                "additionalProperties": True,
+            },
+        }
+    },
+    "additionalProperties": True,
+}
+
+
 _STAGE_SCHEMAS: dict[str, dict] = {
     "identity":    _IDENTITY_SCHEMA,
     "structure":   _STRUCTURE_SCHEMA,
     "enhancement": _ENHANCEMENT_SCHEMA,
+    "evidence":    _EVIDENCE_SCHEMA,
 }
 
 _STAGE_VALIDATORS: dict[str, Draft202012Validator] = {

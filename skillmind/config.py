@@ -29,7 +29,7 @@ CONFIG_FILE = SKILLMIND_HOME / "config.yaml"
 # 提取缓存：同一 source_hash + prompt_version → 直接复用
 EXTRACT_CACHE_DIR = CACHE_DIR / "extract_cache"
 
-CURRENT_PROMPT_VERSION = "extract_v4"
+CURRENT_PROMPT_VERSION = "extract_v5"
 
 # ---------------------------------------------------------------------------
 # 确保目录存在
@@ -78,6 +78,12 @@ _DEFAULT_CONFIG: dict = {
     # 一文多卡时仅当所有卡均 published 才触发
     "cleanup": {
         "auto_after_publish": True,
+    },
+    # extract 阶段开关（W2.2 引入 evidence stage）
+    "extract": {
+        # evidence 阶段：第 4 个 LLM 调用，为 procedure/decision/cross_ref 标原文短引文
+        # 关闭后行为退化为 v2.4（仅 3 个 stage），节省 ~25% Token
+        "enable_evidence": True,
     },
 }
 
