@@ -109,14 +109,21 @@ _STAGE_FOCUS_RULES: dict[str, dict[str, str]] = {
     },
 }
 
-# structure focus rules（按 focus_mode 内容形态层，W2.4 新轴）
+# structure focus rules（按 focus_mode 内容形态层，W2.4 新轴；W2.4-fix concept 重写）
 _STRUCTURE_FOCUS_RULES: dict[str, str] = {
     "procedure": "严格保留执行流程顺序与命令片段；preconditions / halt_conditions / rollback_actions 按原文摘出；"
-                 "decision_points 通常为空。命令片段必须从原文照搬，不要泛化。",
+                 "decision_points 通常为空。命令片段必须从原文照搬，不要泛化。"
+                 "key_concepts 通常为空（不是概念卡）。",
     "decision":  "重点抽取 decision_points（多条件 / 多方案对比 / 选型 tradeoff），condition+then+else 完整成对；"
-                 "procedure 写最终采纳方案的步骤；preconditions 写共同前置；halt 写「应当放弃此路线」的条件。",
-    "concept":   "preconditions / procedure / halt_conditions / rollback_actions 通常为空（除非原文有显式步骤）；"
-                 "cross_references 优先：把关联术语 / 相关概念写成 [[wiki]] 引用；不要为了凑结构强行造步骤。",
+                 "procedure 写最终采纳方案的步骤；preconditions 写共同前置；halt 写「应当放弃此路线」的条件。"
+                 "key_concepts 通常为空。",
+    "concept":   "本卡是概念解释型。**主要产出 key_concepts 数组**，把原文里每个独立概念拆成完整条目：\n"
+                 "  - title：概念名（≤60 字符，与原文小节标题或核心术语对齐）\n"
+                 "  - explanation：**2-4 句白话解释**，覆盖 what / why / 关键要点；**不要只写 1 句话**，卡的灵魂在这里\n"
+                 "  - example（可选）：若原文有示例代码、目录结构、配置模板、对照例子，原样保留（保留 ```代码块``` 形式）\n"
+                 "preconditions / procedure / halt_conditions / rollback_actions 通常为空（除非原文有显式步骤）；\n"
+                 "cross_references **严格**：仅当原文出现 `[[xxx]]` 包裹形式、可识别的文件路径（含扩展名）或 URL 时才填；"
+                 "**禁止把原文小节标题转成 [[wiki]] 链接**（小节内容应写进 key_concepts，不是 cross_references）。",
 }
 
 
@@ -201,12 +208,16 @@ cards_context 中每张卡都标了 focus_mode，请逐张套用下面对应的�
       ],
       "halt_conditions": ["停止条件", "..."],
       "rollback_actions": ["回滚动作", "..."],
-      "cross_references": ["[[关联笔记名]]", "..."]
+      "cross_references": ["[[关联笔记]] 或 实际文件路径", "..."],
+      "key_concepts": [
+        {"title": "概念名", "explanation": "2-4 句白话解释（concept 卡必填且字数充实，其它卡留空）", "example": "可选原文示例（含代码/模板）"}
+      ]
     }
   ]
 }
 
 units 数组顺序必须与 cards_context 一一对应。某字段在原文中不存在或按 focus_mode 规则不适用时保留为空数组。
+concept 类卡片要求 key_concepts 非空且每条 explanation 至少 2 句话；procedure / decision 类卡片 key_concepts 通常为空。
 
 【文档元信息】
 {metadata_json}
@@ -271,12 +282,17 @@ _STAGE_EVIDENCE_PROMPT = """【阶段】原文证据回填（evidence）
 
 【任务】
 前面三个阶段已确定 procedure / decision_points / cross_references。本阶段为每一项标注：
-- source_quote：原文中**能字面找到**的连续短引文（≤60 字符，约 30 个汉字），证明该项来自原文
+- source_quote：原文中**能字面找到**的连续短引文，证明该项来自原文
 - chunk_id：该引文所在的 <<CHUNK N>> 编号
 
 【关键约束】
 1. source_quote 必须是原文出现的连续字符串，不要改写、不要总结、不要翻译。
-2. ≤60 字符硬限制；选最能支撑该项的关键词或短语即可，不需要完整句子。
+2. **严格 ≤80 字符上限**（中英文混合通用）。**只引最关键的 4-8 个词组或短语，不要引完整句子。**
+   - ❌ 反例（超长）："Wait to write test prompts until you've got this part ironed out." (64)
+   - ✅ 正例（关键词组）："Wait to write test prompts"（30）或 "got this part ironed out"（28）
+   - ❌ 反例（完整句）："research in parallel via subagents if available, otherwise inline." (66)
+   - ✅ 正例（关键短语）："research in parallel via subagents"（35）
+   宁可只引关键词，也不要凑完整意思。reader 看到关键词能在原文里搜到就够了。
 3. **如果某项在原文中找不到对应支撑（说明上一阶段是 LLM 编造的），就不要为它输出 evidence 条目。** 留空是允许的，是甄别幻觉的关键。
 4. cross_ref_evidence 的 ref 必须与 cards_with_structure 中给出的字符串完全一致（包括 [[ ]] 包裹）。
 
@@ -793,6 +809,8 @@ def _merge_stage_outputs(
             "halt_conditions": struct.get("halt_conditions") or [],
             "rollback_actions": struct.get("rollback_actions") or [],
             "cross_references": struct.get("cross_references") or [],
+            # W2.4-fix：concept 卡的主要内容承载字段
+            "key_concepts": struct.get("key_concepts") or [],
             "learning_enhancement": enh.get("learning_enhancement") or {},
             "source_reliability": enh.get("source_reliability", "medium"),
             "obsolescence_risk": enh.get("obsolescence_risk", "medium"),
@@ -942,6 +960,20 @@ _STRUCTURE_SCHEMA: dict = {
                     "halt_conditions": {"type": "array", "items": {"type": "string"}},
                     "rollback_actions": {"type": "array", "items": {"type": "string"}},
                     "cross_references": {"type": "array", "items": {"type": "string"}},
+                    # W2.4-fix：concept 类卡片的主要承载字段
+                    "key_concepts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["title", "explanation"],
+                            "properties": {
+                                "title": {"type": "string", "minLength": 1, "maxLength": 60},
+                                "explanation": {"type": "string", "minLength": 10},
+                                "example": {"type": "string"},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
                 },
                 "additionalProperties": True,
             },
@@ -1001,7 +1033,7 @@ _EVIDENCE_SCHEMA: dict = {
                             "required": ["seq", "source_quote", "chunk_id"],
                             "properties": {
                                 "seq": {"type": "integer"},
-                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 60},
+                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 80},
                                 "chunk_id": {"type": "integer", "minimum": 0},
                             },
                             "additionalProperties": True,
@@ -1014,7 +1046,7 @@ _EVIDENCE_SCHEMA: dict = {
                             "required": ["index", "source_quote", "chunk_id"],
                             "properties": {
                                 "index": {"type": "integer", "minimum": 0},
-                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 60},
+                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 80},
                                 "chunk_id": {"type": "integer", "minimum": 0},
                             },
                             "additionalProperties": True,
@@ -1027,7 +1059,7 @@ _EVIDENCE_SCHEMA: dict = {
                             "required": ["ref", "source_quote", "chunk_id"],
                             "properties": {
                                 "ref": {"type": "string", "minLength": 1},
-                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 60},
+                                "source_quote": {"type": "string", "minLength": 1, "maxLength": 80},
                                 "chunk_id": {"type": "integer", "minimum": 0},
                             },
                             "additionalProperties": True,
@@ -1193,6 +1225,7 @@ def _heuristic_extract(text: str, raw_path: Path, source_info: dict) -> dict:
         "halt_conditions": halt_conditions,
         "rollback_actions": rollback_actions,
         "cross_references": [],
+        "key_concepts": [],
         "learning_enhancement": {
             "pain_points": notes,
             "plain_summary": summary or title,
@@ -1271,6 +1304,8 @@ def _assemble_draft(
         "halt_conditions": unit.get("halt_conditions", []),
         "rollback_actions": unit.get("rollback_actions", []),
         "cross_references": unit.get("cross_references", []),
+        # W2.4-fix：concept 卡的主要承载字段
+        "key_concepts": unit.get("key_concepts", []),
         "learning_enhancement": unit.get("learning_enhancement", {}),
         "source_reliability": unit.get("source_reliability", "medium"),
         "obsolescence_risk": unit.get("obsolescence_risk", "medium"),

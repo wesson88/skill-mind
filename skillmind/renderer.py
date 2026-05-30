@@ -228,6 +228,33 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             lines.append(f"- {r}")
         lines.append("")
 
+    # --- 核心概念（W2.4-fix concept 卡主承载字段）---
+    key_concepts = data.get("key_concepts", [])
+    if key_concepts:
+        lines.append("## 📖 核心概念")
+        for kc in key_concepts:
+            title = kc.get("title", "")
+            explanation = kc.get("explanation", "")
+            example = kc.get("example", "")
+            lines.append(f"### {title}")
+            if explanation:
+                lines.append(explanation)
+                lines.append("")
+            if example:
+                stripped = example.strip()
+                if stripped.startswith("```"):
+                    # 已经是完整代码块，直接保留
+                    lines.append(stripped)
+                else:
+                    # 包裹围栏；动态宽度避免被内容里的 ``` 提前闭合
+                    fence = "`" * max(3, _max_backticks_run(example) + 1)
+                    lines.append(fence)
+                    for ex_line in example.splitlines():
+                        lines.append(ex_line)
+                    lines.append(fence)
+                lines.append("")
+        lines.append("")
+
     # --- 关联知识 ---
     cross_references = data.get("cross_references", [])
     if cross_references:
