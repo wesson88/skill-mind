@@ -79,11 +79,15 @@ _DEFAULT_CONFIG: dict = {
     "cleanup": {
         "auto_after_publish": True,
     },
-    # extract 阶段开关（W2.2 引入 evidence stage）
+    # extract 阶段开关（W2.2 引入 evidence stage；W2.3 引入 reflective stage）
     "extract": {
-        # evidence 阶段：第 4 个 LLM 调用，为 procedure/decision/cross_ref 标原文短引文
+        # evidence 阶段（W2.2）：第 4 个 LLM 调用，为 procedure/decision/cross_ref 标原文短引文
         # 关闭后行为退化为 v2.4（仅 3 个 stage），节省 ~25% Token
         "enable_evidence": True,
+        # reflective 阶段（W2.3）：第 5 个 LLM 调用，对照原文挑错，输出 quality_score + issues
+        # 默认关；低可信度来源（source_reliability=low）会自动触发（除非下行关闭）
+        "enable_reflective": False,
+        "reflective_auto_for_low": True,
     },
 }
 

@@ -115,6 +115,8 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
         "published_at": source.get("published_at", ""),
         "source_reliability": reliability,
         "obsolescence_risk": obsolescence,
+        # W2.3：reflective 阶段输出（无则被 cleanup 过滤）
+        "reflective_quality": data.get("reflective_quality", ""),
         "parent_source": source.get("parent_source", ""),
         "prompt_version": data.get("prompt_version", ""),
         "status": data.get("status", "published"),
@@ -267,6 +269,26 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
                 lines.append(f"- {ref_text}{quote_tag}")
             else:
                 lines.append(f"- {ref}")
+        lines.append("")
+
+    # --- 反思发现（W2.3 reflective stage）---
+    reflective_issues = data.get("reflective_issues", [])
+    reflective_quality = data.get("reflective_quality", "")
+    if reflective_issues or reflective_quality:
+        q_badge = {"high": "🟢 高", "medium": "🟡 中", "low": "🔴 低"}.get(
+            reflective_quality, reflective_quality or "未评估"
+        )
+        lines.append(f"## 🔍 反思发现 （自评质量：{q_badge}）")
+        if not reflective_issues:
+            lines.append("- 无明显问题")
+        else:
+            for iss in reflective_issues:
+                field = iss.get("field", "")
+                issue = iss.get("issue", "")
+                suggestion = iss.get("suggestion", "")
+                lines.append(f"- **`{field}`** — {issue}")
+                if suggestion:
+                    lines.append(f"  - 建议：{suggestion}")
         lines.append("")
 
     # --- 环境信息 ---

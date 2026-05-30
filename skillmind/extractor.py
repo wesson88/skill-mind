@@ -33,12 +33,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+import yaml
 from jsonschema import Draft202012Validator
 
 from skillmind.chunker import Chunker, join_chunks_for_prompt
 from skillmind.config import (
     CURRENT_PROMPT_VERSION,
     EXTRACT_CACHE_DIR,
+    PROMPTS_DIR,
     ensure_dirs,
     resolve_llm_credentials,
 )
@@ -327,14 +329,139 @@ units 顺序与 cards_with_structure 严格对齐。各 evidence 数组在找不
 请直接输出 JSON。"""
 
 
+# ── Stage 5: reflective（W2.3，对照原文校对） ─────────────────────────────
+
+_STAGE_REFLECTIVE_PROMPT = """【阶段】反思校对（reflective）
+
+【任务】
+对照原文，校对前几个阶段产出的每张卡片。你的角色不是再抽一遍，而是**找错**：
+- 事实错误：与原文矛盾（命令参数错抄、把"建议"说成"必须"、说了原文没有的话）
+- 遗漏：原文有重要点但卡里没收到（重要细节、关键约束、原作者强调过的注意事项）
+- 过度概括：原文有具体例子/数字/路径但卡里抽象掉了
+- 结构错位：procedure 顺序对调、decision then/else 互换、把概念归到 procedure 卡等
+
+【严格要求】
+1. 只报实际发现的问题，不要为了凑数硬找。卡片质量好就给 quality_score=high 并 issues=[]。
+2. 每个 issue 必须能指向具体字段路径（field），例如 `procedure[3]` / `key_concepts[1].explanation` / `decision_points[0].else`。
+3. issue 内容简洁（≤200 字），suggestion 给出具体修法。
+4. 不要重写整张卡 —— 这是 W2.3 阶段的目标，下一波（不在本阶段）才考虑自动修。
+
+【字段定义】
+{
+  "units": [
+    {
+      "quality_score": "high | medium | low",
+      "issues": [
+        {
+          "field": "procedure[3] | key_concepts[1].explanation | cross_references | decision_points[0].else",
+          "issue": "原文是 `git clone --depth 1` 但卡里写成 `git clone`，缺关键参数",
+          "suggestion": "补回 --depth 1"
+        }
+      ]
+    }
+  ]
+}
+
+units 顺序与 cards_with_full_content 严格对齐。无问题时 issues 留空数组、quality_score 标 high。
+
+【已抽取的卡片（含 procedure / decisions / key_concepts / cross_refs 全部内容）】
+{cards_with_full_content_json}
+
+【文档元信息】
+{metadata_json}
+
+【文档正文（doc_type={doc_type}）】
+{content}
+
+请直接输出 JSON。"""
+
+
 _STAGE_PROMPTS: dict[str, str] = {
     "identity":    _STAGE_IDENTITY_PROMPT,
     "structure":   _STAGE_STRUCTURE_PROMPT,
     "enhancement": _STAGE_ENHANCEMENT_PROMPT,
     "evidence":    _STAGE_EVIDENCE_PROMPT,
+    "reflective":  _STAGE_REFLECTIVE_PROMPT,
 }
 
-_STAGE_ORDER: tuple[str, ...] = ("identity", "structure", "enhancement", "evidence")
+_STAGE_ORDER: tuple[str, ...] = ("identity", "structure", "enhancement", "evidence", "reflective")
+
+
+# ---------------------------------------------------------------------------
+# W2.5：prompt 模板外移 —— ~/.skillmind/prompts/<stage>.yaml > 内置默认
+# ---------------------------------------------------------------------------
+
+def _load_prompt(stage: str) -> str:
+    """优先从 PROMPTS_DIR/<stage>.yaml 读 template；缺失/格式错误时回落到内置默认。
+
+    yaml 示例（用户可编辑）：
+        stage: identity
+        description: 身份识别 ...
+        template: |
+          【阶段】...
+    """
+    yaml_path = PROMPTS_DIR / f"{stage}.yaml"
+    if yaml_path.exists():
+        try:
+            data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+            if (isinstance(data, dict)
+                    and isinstance(data.get("template"), str)
+                    and data["template"].strip()):
+                return data["template"]
+        except (yaml.YAMLError, OSError):
+            pass
+    return _STAGE_PROMPTS[stage]
+
+
+class _LiteralStr(str):
+    """W2.5：标记字符串用 YAML | 块式输出（多行可读）。"""
+
+
+def _literal_str_representer(dumper, data):
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+
+
+yaml.add_representer(_LiteralStr, _literal_str_representer)
+
+
+def export_prompts_to_yaml(force: bool = False) -> dict:
+    """把内置 prompt 模板写到 ~/.skillmind/prompts/<stage>.yaml，便于用户直接编辑。
+
+    template 字段以 YAML 块式（|）输出，保持多行可读形式。
+
+    返回 {stage: 'created' | 'skipped' | 'overwritten'} 字典。
+    """
+    ensure_dirs()
+    statuses: dict[str, str] = {}
+    for stage in _STAGE_ORDER:
+        template = _STAGE_PROMPTS[stage]
+        target = PROMPTS_DIR / f"{stage}.yaml"
+        existed = target.exists()
+        if existed and not force:
+            statuses[stage] = "skipped"
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "stage": stage,
+            "description": (
+                f"{stage} 阶段 prompt 模板（W2.5 外移；可直接编辑此文件实战调优，"
+                f"删除文件回落到内置默认）"
+            ),
+            # 用 _LiteralStr 触发 YAML | 块式输出
+            "template": _LiteralStr(template),
+        }
+        text = yaml.dump(
+            data,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+            width=200,
+        )
+        tmp = target.with_suffix(".yaml.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(target)
+        statuses[stage] = "overwritten" if existed else "created"
+    return statuses
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +661,34 @@ def _llm_extract(
     elif console:
         console.print(f"  [dim]evidence: 已关闭（extract.enable_evidence=false）[/dim]")
 
+    # 7. Stage 5: reflective（W2.3，默认关；source_reliability=low 时自动开）
+    enable_reflective = bool(cfg.get("extract", {}).get("enable_reflective", False))
+    auto_for_low = bool(cfg.get("extract", {}).get("reflective_auto_for_low", True))
+    has_low = any((u.get("source_reliability") == "low") for u in units)
+    should_run_reflective = enable_reflective or (auto_for_low and has_low)
+    if should_run_reflective:
+        try:
+            reflective = _run_or_load_stage(
+                stage="reflective",
+                source_hash=source_hash,
+                prompt_version=prompt_version,
+                text=text_for_llm,
+                doc_type=doc_type,
+                metadata=metadata,
+                prev_context={"units": units},
+                creds=creds,
+                cfg=cfg,
+                console=console,
+            )
+            ref_units = reflective.get("units") or []
+            units = _apply_reflective(units, ref_units, console=console)
+        except Exception as e:
+            if console:
+                console.print(f"  [yellow]⚠ reflective 阶段失败，跳过校对:[/yellow] {e}")
+    elif console:
+        reason = "未启用" if not enable_reflective else "（启用但无 low 可信度卡片）"
+        console.print(f"  [dim]reflective: 已跳过 {reason}[/dim]")
+
     return units
 
 
@@ -624,7 +779,8 @@ def _build_stage_prompt(
                      LLM 按 cards_context 里每张卡的 focus_mode 自选
       - enhancement: {focus_rules} 按 doc_type
     """
-    template = _STAGE_PROMPTS[stage]
+    # W2.5：优先读 ~/.skillmind/prompts/<stage>.yaml，未定制则回落内置
+    template = _load_prompt(stage)
 
     p = (
         template
@@ -669,6 +825,29 @@ def _build_stage_prompt(
         p = p.replace(
             "{cards_json}",
             json.dumps(cards_brief, ensure_ascii=False, indent=2),
+        )
+
+    # reflective 阶段：构造完整 units 上下文（含 procedure / key_concepts / refs 等）
+    if "{cards_with_full_content_json}" in p:
+        units_brief = []
+        for u in prev_context.get("units", []) or []:
+            meta = u.get("meta", {}) or {}
+            units_brief.append({
+                "name": meta.get("name", ""),
+                "focus_mode": meta.get("focus_mode", ""),
+                "intent": meta.get("intent", ""),
+                "preconditions": u.get("preconditions") or [],
+                "procedure": u.get("procedure") or [],
+                "decision_points": u.get("decision_points") or [],
+                "halt_conditions": u.get("halt_conditions") or [],
+                "rollback_actions": u.get("rollback_actions") or [],
+                "cross_references": u.get("cross_references") or [],
+                "key_concepts": u.get("key_concepts") or [],
+                "source_reliability": u.get("source_reliability", ""),
+            })
+        p = p.replace(
+            "{cards_with_full_content_json}",
+            json.dumps(units_brief, ensure_ascii=False, indent=2),
         )
 
     # evidence 阶段特有：构造含 procedure/decision/cross_refs 的丰富上下文
@@ -779,6 +958,49 @@ def _apply_evidence(
     return units
 
 
+def _apply_reflective(
+    units: list[dict],
+    reflective_units: list[dict],
+    *,
+    console=None,
+) -> list[dict]:
+    """W2.3：把 reflective 阶段输出（quality_score + issues）合并进 units。
+
+    不自动修，纯信息性。frontmatter 加 reflective_quality；笔记体加 🔍 反思发现段。
+    """
+    total_issues = 0
+    quality_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+    for i, unit in enumerate(units):
+        if i >= len(reflective_units):
+            unit["reflective_quality"] = "unknown"
+            unit["reflective_issues"] = []
+            continue
+        ref = reflective_units[i] or {}
+        q = ref.get("quality_score", "unknown")
+        issues = [
+            {
+                "field": iss.get("field", ""),
+                "issue": iss.get("issue", ""),
+                "suggestion": iss.get("suggestion", ""),
+            }
+            for iss in (ref.get("issues") or [])
+            if isinstance(iss, dict) and iss.get("field") and iss.get("issue")
+        ]
+        unit["reflective_quality"] = q
+        unit["reflective_issues"] = issues
+        if q in quality_counts:
+            quality_counts[q] += 1
+        total_issues += len(issues)
+
+    if console:
+        console.print(
+            f"  [cyan]reflective:[/cyan] {len(units)} 卡 → "
+            f"high {quality_counts['high']} / medium {quality_counts['medium']} / low {quality_counts['low']}；"
+            f"发现 {total_issues} 个问题"
+        )
+    return units
+
+
 def _merge_stage_outputs(
     cards: list[dict],
     struct_units: list[dict],
@@ -814,6 +1036,9 @@ def _merge_stage_outputs(
             "learning_enhancement": enh.get("learning_enhancement") or {},
             "source_reliability": enh.get("source_reliability", "medium"),
             "obsolescence_risk": enh.get("obsolescence_risk", "medium"),
+            # W2.3：reflective 阶段输出（可能未跑则保持空，由 _apply_reflective 后填）
+            "reflective_quality": "",
+            "reflective_issues": [],
         })
     return units
 
@@ -1074,11 +1299,47 @@ _EVIDENCE_SCHEMA: dict = {
 }
 
 
+# Stage 5: reflective → {"units": [{quality_score, issues: [{field, issue, suggestion?}]}, ...]}
+_REFLECTIVE_SCHEMA: dict = {
+    "type": "object",
+    "required": ["units"],
+    "properties": {
+        "units": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["quality_score"],
+                "properties": {
+                    "quality_score": {"enum": ["high", "medium", "low"]},
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["field", "issue"],
+                            "properties": {
+                                "field": {"type": "string", "minLength": 1, "maxLength": 80},
+                                "issue": {"type": "string", "minLength": 5, "maxLength": 240},
+                                "suggestion": {"type": "string", "maxLength": 240},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                },
+                "additionalProperties": True,
+            },
+        }
+    },
+    "additionalProperties": True,
+}
+
+
 _STAGE_SCHEMAS: dict[str, dict] = {
     "identity":    _IDENTITY_SCHEMA,
     "structure":   _STRUCTURE_SCHEMA,
     "enhancement": _ENHANCEMENT_SCHEMA,
     "evidence":    _EVIDENCE_SCHEMA,
+    "reflective":  _REFLECTIVE_SCHEMA,
 }
 
 _STAGE_VALIDATORS: dict[str, Draft202012Validator] = {
@@ -1226,6 +1487,8 @@ def _heuristic_extract(text: str, raw_path: Path, source_info: dict) -> dict:
         "rollback_actions": rollback_actions,
         "cross_references": [],
         "key_concepts": [],
+        "reflective_quality": "",
+        "reflective_issues": [],
         "learning_enhancement": {
             "pain_points": notes,
             "plain_summary": summary or title,
@@ -1309,6 +1572,9 @@ def _assemble_draft(
         "learning_enhancement": unit.get("learning_enhancement", {}),
         "source_reliability": unit.get("source_reliability", "medium"),
         "obsolescence_risk": unit.get("obsolescence_risk", "medium"),
+        # W2.3：reflective 阶段输出（未跑时为空）
+        "reflective_quality": unit.get("reflective_quality", ""),
+        "reflective_issues": unit.get("reflective_issues", []),
         "prompt_version": prompt_version,
         "status": "draft",
         "created_at": time.strftime("%Y-%m-%d"),

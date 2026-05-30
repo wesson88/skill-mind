@@ -53,6 +53,15 @@ cache_app = typer.Typer(
 )
 app.add_typer(cache_app, name="cache")
 
+# prompts 子命令组（W2.5）
+prompts_app = typer.Typer(
+    name="prompts",
+    help="📝 Prompt 模板管理（外移到 ~/.skillmind/prompts/<stage>.yaml 后可实战调优）",
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+app.add_typer(prompts_app, name="prompts")
+
 console = Console()
 
 
@@ -708,12 +717,97 @@ def cache_clean_cmd(
 
 
 # ---------------------------------------------------------------------------
+# prompts list / export / reset（W2.5）
+# ---------------------------------------------------------------------------
+
+@prompts_app.command("list")
+def prompts_list_cmd():
+    """📋 列出当前 prompt 状态（内置默认 vs 用户覆盖）"""
+    from skillmind.config import PROMPTS_DIR
+    from skillmind.extractor import _STAGE_ORDER
+
+    table = Table(title="Prompt 模板状态", box=box.ROUNDED)
+    table.add_column("Stage", style="bold")
+    table.add_column("路径")
+    table.add_column("状态")
+    for stage in _STAGE_ORDER:
+        path = PROMPTS_DIR / f"{stage}.yaml"
+        if path.exists():
+            status = f"[green]已外移（用户可编辑）[/green]"
+        else:
+            status = "[dim]使用内置默认[/dim]"
+        table.add_row(stage, str(path), status)
+    console.print(table)
+    console.print("\n[dim]提示：`skillmind prompts export` 把内置默认写到 yaml 文件供编辑[/dim]")
+
+
+@prompts_app.command("export")
+def prompts_export_cmd(
+    force: bool = typer.Option(False, "--force", "-f", help="覆盖已存在的 yaml 文件"),
+):
+    """💾 把内置 prompt 写到 ~/.skillmind/prompts/<stage>.yaml（不存在则创建）"""
+    from skillmind.extractor import export_prompts_to_yaml
+    from skillmind.config import PROMPTS_DIR
+
+    statuses = export_prompts_to_yaml(force=force)
+
+    created = [s for s, st in statuses.items() if st == "created"]
+    overwritten = [s for s, st in statuses.items() if st == "overwritten"]
+    skipped = [s for s, st in statuses.items() if st == "skipped"]
+
+    if created:
+        console.print(f"[green]✓ 新建 {len(created)} 个：[/green]{', '.join(created)}")
+    if overwritten:
+        console.print(f"[yellow]↻ 覆盖 {len(overwritten)} 个：[/yellow]{', '.join(overwritten)}")
+    if skipped:
+        console.print(
+            f"[dim]⟳ 跳过 {len(skipped)} 个（文件已存在；加 --force 覆盖）：{', '.join(skipped)}[/dim]"
+        )
+    console.print(f"\n[bold]存储位置:[/bold] {PROMPTS_DIR}")
+    console.print(
+        "[dim]提示：编辑这些 yaml 后，下次 extract 自动加载新版本；删除文件回落到代码内置默认。[/dim]"
+    )
+
+
+@prompts_app.command("reset")
+def prompts_reset_cmd(
+    stage: Optional[str] = typer.Option(None, "--stage", "-s", help="指定 stage（identity/structure/enhancement/evidence/reflective）；省略则全部"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认"),
+):
+    """🔄 删除 yaml 自定义 prompt，恢复内置默认"""
+    from skillmind.config import PROMPTS_DIR
+    from skillmind.extractor import _STAGE_ORDER
+
+    if stage and stage not in _STAGE_ORDER:
+        console.print(f"[red]未知 stage: {stage}（可选: {', '.join(_STAGE_ORDER)}）[/red]")
+        raise typer.Exit(1)
+
+    targets = [stage] if stage else list(_STAGE_ORDER)
+    existing = [s for s in targets if (PROMPTS_DIR / f"{s}.yaml").exists()]
+    if not existing:
+        console.print("[green]没有需要删除的 yaml（当前已全用内置）[/green]")
+        return
+    if not yes:
+        console.print(f"[yellow]将删除 {len(existing)} 个 yaml：{', '.join(existing)}[/yellow]")
+        console.print("[yellow]加 --yes 确认[/yellow]")
+        raise typer.Exit(1)
+    for s in existing:
+        try:
+            (PROMPTS_DIR / f"{s}.yaml").unlink()
+            console.print(f"[green]✓ 删除[/green] {s}.yaml")
+        except OSError as e:
+            console.print(f"[red]✗ 删除失败:[/red] {s}.yaml → {e}")
+
+
+# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 
 @app.command()
 def status():
     """📊 展示知识库统计信息"""
+    import re as _re
+    import yaml as _yaml
     from skillmind.reviewer import list_drafts
     from skillmind.collector import list_cached
     from skillmind.config import load_config, CURRENT_PROMPT_VERSION, get_vault_dir
@@ -723,10 +817,26 @@ def status():
     all_drafts = list_drafts()
 
     draft_count = sum(1 for d in all_drafts if d.get("status") == "draft")
-    published_count = sum(1 for d in all_drafts if d.get("status") == "published")
     approved_count = sum(1 for d in all_drafts if d.get("status") == "approved")
-    old_prompt = [d for d in all_drafts if d.get("status") == "published"
-                  and not d.get("prompt_version", "").startswith(CURRENT_PROMPT_VERSION)]
+
+    # W2.4c 后 auto-cleanup 会删除已发布草稿，所以 published_count 不能再依赖 drafts/。
+    # 改为扫 vault skills/ 目录里 .md 文件 + 读取 frontmatter 统计 prompt_version。
+    vault_skills = get_vault_dir(cfg) / "skills"
+    published_count = 0
+    old_prompt: list[dict] = []
+    if vault_skills.exists():
+        for note_path in vault_skills.glob("*.md"):
+            published_count += 1
+            try:
+                text = note_path.read_text(encoding="utf-8")
+                m = _re.match(r"---\n(.*?)\n---\n", text, _re.DOTALL)
+                if m:
+                    fm = _yaml.safe_load(m.group(1)) or {}
+                    pv = fm.get("prompt_version", "") or ""
+                    if pv and not pv.startswith(CURRENT_PROMPT_VERSION):
+                        old_prompt.append({"prompt_version": pv, "path": str(note_path)})
+            except (OSError, _yaml.YAMLError):
+                continue
 
     # 按 doc_type 统计缓存
     type_counts: dict[str, int] = {}
