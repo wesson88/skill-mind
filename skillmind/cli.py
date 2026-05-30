@@ -38,13 +38,58 @@ app = typer.Typer(
 # ingest 子命令组
 ingest_app = typer.Typer(
     name="ingest",
-    help="📥 采集知识来源（skill / rss / url / forum）",
+    help="📥 采集知识来源（auto 自动分派 / skill / rss / url / forum）",
     add_completion=False,
     rich_markup_mode="rich",
 )
 app.add_typer(ingest_app, name="ingest")
 
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# ingest auto（W2.4b：按输入自动分派）
+# ---------------------------------------------------------------------------
+
+@ingest_app.command("auto")
+def ingest_auto_cmd(
+    target: str = typer.Argument(
+        ...,
+        help="任意输入：本地路径 / GitHub 仓库 URL / RSS Feed / 论坛帖 / 单篇文章 URL"
+    ),
+    type_override: Optional[str] = typer.Option(
+        None, "--type", "-t",
+        help="强制指定类型（skill / rss / url / forum），跳过自动探测"
+    ),
+    max_items: int = typer.Option(50, "--max", "-n", help="RSS 模式下最多抓取条目数"),
+):
+    """🤖 自动识别输入类型并分派（推荐入口）
+
+    探测规则：本地路径/.git/github.com 仓库根 → skill；含 feed/rss/atom 或 .xml/.rss/.atom 后缀 → rss；
+    reddit/HN/Discourse 模式 → forum；其它 http(s) → url。识别错可加 `--type` 强制覆盖。
+    """
+    from skillmind.collector import ingest_auto
+
+    try:
+        kind, results = ingest_auto(
+            target,
+            kind_override=type_override,
+            max_items=max_items,
+            console=console,
+        )
+    except Exception as e:
+        console.print(f"[bold red]采集失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+    new_count = sum(1 for r in results if not r.get("skipped"))
+    skip_count = sum(1 for r in results if r.get("skipped"))
+    console.print(
+        Panel(
+            f"✅ 采集完成（分派到 [bold]{kind}[/bold]）\n"
+            f"  新增: [green]{new_count}[/green]　跳过: [yellow]{skip_count}[/yellow]　合计: {len(results)}",
+            title="[bold]Auto 采集结果[/bold]", border_style="green",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

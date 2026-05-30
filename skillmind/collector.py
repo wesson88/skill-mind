@@ -1,21 +1,25 @@
-"""采集器（Collector）v2.2
+"""采集器（Collector）v2.4
 
-将四类来源统一缓存到 ~/.skillmind/cache/raw/，并维护 hashes.yaml：
+将多类来源统一缓存到 ~/.skillmind/cache/raw/，并维护 hashes.yaml：
 
 - ingest_skill : 本地目录 / Git 仓库 → SKILL.md            (doc_type=skill)
 - ingest_rss   : RSS / Atom Feed → 批量博客文章             (doc_type=blog)
 - ingest_url   : 单篇文章 / 博客 URL                        (doc_type=blog)
 - ingest_forum : 论坛主题帖（Discourse / Reddit / HN 等）   (doc_type=forum_post)
+- ingest_auto  : 按输入自动分派到上面 4 个之一（W2.4b 新增）
 
 设计要点：
 - 文件级去重：SHA256 内容哈希一致即跳过。
 - 原子写：hashes.yaml、raw 文件均走 tmp → replace。
 - v1 旧 hashes.yaml 条目无 doc_type，list_cached 兜底为 "skill"。
+- W2.4 起：doc_type 仅作"容器层"元信息，不再驱动 extraction 形态选择
+  （extraction 形态由 extractor.identity 阶段输出的 focus_mode 决定）。
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import time
 from pathlib import Path
@@ -459,3 +463,98 @@ def ingest_rss(feed_url: str, console=None, max_items: int = 50) -> list[dict]:
 def ingest_forum(topic_url: str, console=None) -> list[dict]:
     """采集论坛主题帖（Discourse / Reddit / HN）。当前降级为通用抓取。"""
     return ingest_url(topic_url, console=console, doc_type="forum_post")
+
+
+# ---------------------------------------------------------------------------
+# ingest_auto：按输入模式自动分派（W2.4b）
+# ---------------------------------------------------------------------------
+
+# 论坛模式判定
+_FORUM_PATTERNS = (
+    re.compile(r"reddit\.com/r/[^/]+/comments/", re.I),
+    re.compile(r"news\.ycombinator\.com/item\?id=\d+", re.I),
+    re.compile(r"/t/[^/]+/\d+(?:/\d+)?/?$"),   # Discourse 主题路径
+)
+
+# RSS / Atom Feed 模式
+_RSS_HINTS = ("/feed", "/rss", "/atom", "/feeds/", "/feed.xml", "/rss.xml")
+_RSS_SUFFIXES = (".xml", ".rss", ".atom")
+
+# GitHub 仓库根 URL（不含 /blob /tree /pull 等子路径）
+_GITHUB_REPO_RE = re.compile(r"^https?://(?:www\.)?github\.com/[^/]+/[^/?#]+/?(?:\?|#|$)", re.I)
+
+
+def detect_input_kind(input_str: str) -> str:
+    """探测输入类型，返回 'skill' / 'rss' / 'forum' / 'url' 之一。
+
+    优先级：本地路径 > Git 仓库根 > .git 后缀 > 论坛模式 > RSS 模式 > 通用 url
+    """
+    s = (input_str or "").strip()
+    if not s:
+        return "url"
+
+    # 1. 本地路径（绝对或相对，存在即视为 skill 容器）
+    try:
+        p = Path(s).expanduser()
+        if p.exists():
+            return "skill"
+    except (OSError, ValueError):
+        pass
+
+    # 2. *.git URL
+    if s.endswith(".git"):
+        return "skill"
+
+    # 3. github.com/user/repo 仓库根（带可选 trailing slash / query / fragment）
+    if _GITHUB_REPO_RE.match(s):
+        return "skill"
+
+    low = s.lower()
+
+    # 4. 论坛模式
+    for pat in _FORUM_PATTERNS:
+        if pat.search(s):
+            return "forum"
+
+    # 5. RSS / Atom
+    # 5a. 路径片段命中
+    for hint in _RSS_HINTS:
+        if hint in low:
+            return "rss"
+    # 5b. URL 路径以已知后缀结尾（剥 query / fragment 后判断）
+    try:
+        path = urlparse(s).path.lower()
+        if path.endswith(_RSS_SUFFIXES):
+            return "rss"
+    except (ValueError, AttributeError):
+        pass
+
+    # 6. 其他 http(s) → 单篇 URL
+    return "url"
+
+
+def ingest_auto(
+    input_str: str,
+    *,
+    kind_override: str | None = None,
+    max_items: int = 50,
+    console=None,
+) -> tuple[str, list[dict]]:
+    """按 detect_input_kind 自动分派到 ingest_skill / ingest_rss / ingest_url / ingest_forum。
+
+    返回 (实际使用的 kind, results)。kind_override 不为空时跳过自动探测。
+    """
+    kind = (kind_override or detect_input_kind(input_str)).lower()
+    if kind not in ("skill", "rss", "url", "forum"):
+        raise ValueError(f"未知 ingest 类型: {kind!r}（合法值：skill / rss / url / forum）")
+
+    if console:
+        console.print(f"[dim]auto-detect:[/dim] [bold]{kind}[/bold]  ← {input_str}")
+
+    if kind == "skill":
+        return kind, ingest_skill(input_str, console=console)
+    if kind == "rss":
+        return kind, ingest_rss(input_str, console=console, max_items=max_items)
+    if kind == "forum":
+        return kind, ingest_forum(input_str, console=console)
+    return kind, ingest_url(input_str, console=console)
