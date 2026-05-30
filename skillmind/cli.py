@@ -44,6 +44,15 @@ ingest_app = typer.Typer(
 )
 app.add_typer(ingest_app, name="ingest")
 
+# cache 子命令组（W2.4c）
+cache_app = typer.Typer(
+    name="cache",
+    help="🧹 缓存管理（统计与清理 raw / extract_cache / drafts）",
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+app.add_typer(cache_app, name="cache")
+
 console = Console()
 
 
@@ -394,6 +403,8 @@ def publish(
         console.print("[yellow]没有待发布的草稿[/yellow]")
         return
 
+    auto_cleanup = bool(cfg.get("cleanup", {}).get("auto_after_publish", True))
+    cleaned_sources = 0
     success = 0
     for draft in targets:
         try:
@@ -402,9 +413,20 @@ def publish(
             save_draft(draft)
             console.print(f"[green]✓ 已发布:[/green] {draft.get('meta',{}).get('name','')} → {dest}")
             success += 1
+
+            # W2.4c：所有卡都发布完，自动清理该来源
+            if auto_cleanup:
+                src_hash = draft.get("source", {}).get("source_hash", "")
+                if src_hash:
+                    from skillmind.cache_admin import cleanup_after_publish
+                    r = cleanup_after_publish(src_hash, console=console)
+                    if r.get("cleaned"):
+                        cleaned_sources += 1
         except Exception as e:
             console.print(f"[red]✗ 发布失败:[/red] {draft.get('uuid','')} → {e}")
 
+    if auto_cleanup and cleaned_sources:
+        console.print(f"[dim]已自动清理 {cleaned_sources} 个完成发布的来源（raw + extract_cache + 草稿）[/dim]")
     console.print(f"\n[bold green]发布完成: {success}/{len(targets)}[/bold green]")
 
     try:
@@ -537,6 +559,152 @@ def _open_local(path: str) -> None:
             subprocess.call(["xdg-open", path])
     except Exception:
         console.print(f"[yellow]无法自动打开文件，请手动访问:[/yellow] {path}")
+
+
+# ---------------------------------------------------------------------------
+# cache list / cache clean（W2.4c）
+# ---------------------------------------------------------------------------
+
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+@cache_app.command("list")
+def cache_list_cmd():
+    """📊 显示缓存统计（raw / extract_cache / drafts / 孤儿 / 已发布）"""
+    from skillmind.cache_admin import cache_stats, find_orphan_entries, find_published_entries
+
+    stats = cache_stats()
+    table = Table(title="缓存全景", box=box.ROUNDED)
+    table.add_column("指标", style="bold")
+    table.add_column("数量", justify="right")
+    table.add_column("大小", justify="right", style="dim")
+
+    table.add_row("hashes.yaml 总条目", str(stats["hashes_total"]), "")
+    table.add_row("  └ 活跃（未发布）", str(stats["hashes_active"]), "")
+    table.add_row("  └ 已发布（cleanup 后保留 dedup）", f"[green]{stats['hashes_published']}[/green]", "")
+    table.add_row("  └ 孤儿（raw 缺失）", f"[yellow]{stats['hashes_orphan']}[/yellow]", "")
+    table.add_row("raw 文件", str(stats["raw_files"]), _fmt_size(stats["raw_bytes"]))
+    table.add_row("extract_cache 文件", str(stats["extract_files"]), _fmt_size(stats["extract_bytes"]))
+    table.add_row("草稿（drafts/）", str(stats["drafts_total"]), "")
+    table.add_row("Git 仓库克隆", str(stats["repos_clones"]), "")
+    console.print(table)
+
+    orphans = find_orphan_entries()
+    if orphans:
+        console.print(f"\n[yellow]孤儿条目（hashes.yaml 有但 raw 文件不存在）{len(orphans)} 条：[/yellow]")
+        for o in orphans[:5]:
+            console.print(f"  {o['source_hash'][:8]}  {o.get('source_path', o.get('source_url',''))[:80]}")
+        if len(orphans) > 5:
+            console.print(f"  [dim]... 共 {len(orphans)} 条，跑 `cache clean --orphan` 清理[/dim]")
+
+    published = find_published_entries()
+    if published:
+        console.print(f"\n[green]已发布条目（保留 dedup，raw/extract 已清）{len(published)} 条[/green]")
+
+
+@cache_app.command("clean")
+def cache_clean_cmd(
+    hash_prefix: Optional[str] = typer.Option(None, "--hash", "-H", help="按 source_hash 前缀清单条来源"),
+    orphan: bool = typer.Option(False, "--orphan", help="清孤儿条目（raw 缺失）"),
+    published: bool = typer.Option(False, "--published", help="清已发布条目（彻底删除 hashes.yaml 中标记 published 的条目）"),
+    wipe: bool = typer.Option(False, "--all", help="全清：raw + extract_cache + drafts + hashes.yaml"),
+    include_repos: bool = typer.Option(False, "--include-repos", help="搭配 --all 时一并删除 Git 克隆缓存（默认保留）"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认提示"),
+):
+    """🧹 清理缓存。必须指定 --hash / --orphan / --published / --all 之一。"""
+    from skillmind.cache_admin import (
+        cleanup_source, cleanup_orphans, find_published_entries, find_orphan_entries,
+        wipe_all_caches, wipe_repos, cache_stats,
+    )
+    from skillmind.collector import _load_hashes, _save_hashes
+
+    flags = [bool(hash_prefix), orphan, published, wipe]
+    if sum(flags) == 0:
+        console.print("[yellow]请指定 --hash / --orphan / --published / --all 之一[/yellow]")
+        raise typer.Exit(1)
+    if sum(flags) > 1:
+        console.print("[yellow]--hash / --orphan / --published / --all 互斥，请只选一个[/yellow]")
+        raise typer.Exit(1)
+
+    if hash_prefix:
+        hashes = _load_hashes()
+        matched = [sha for sha in hashes if sha.startswith(hash_prefix)]
+        if not matched:
+            console.print(f"[red]未找到匹配的 source_hash: {hash_prefix}[/red]")
+            raise typer.Exit(1)
+        if len(matched) > 1 and not yes:
+            console.print(f"[yellow]匹配到 {len(matched)} 条，加 --yes 确认全部清理[/yellow]")
+            for sha in matched[:5]:
+                info = hashes[sha]
+                console.print(f"  {sha[:8]}  {info.get('source_path', info.get('source_url',''))[:80]}")
+            raise typer.Exit(1)
+        for sha in matched:
+            cleanup_source(sha, console=console)
+            # --hash 模式下顺手把 hashes.yaml 条目也删了（彻底"忘记"该来源）
+            hashes = _load_hashes()
+            if sha in hashes:
+                del hashes[sha]
+                _save_hashes(hashes)
+        console.print(f"[green]✓ 已清理 {len(matched)} 条来源（含 hashes.yaml 条目）[/green]")
+        return
+
+    if orphan:
+        orphans = find_orphan_entries()
+        if not orphans:
+            console.print("[green]没有孤儿条目[/green]")
+            return
+        if not yes:
+            console.print(f"[yellow]将清理 {len(orphans)} 条孤儿条目。加 --yes 确认[/yellow]")
+            for o in orphans[:5]:
+                console.print(f"  {o['source_hash'][:8]}  {o.get('source_path', o.get('source_url',''))[:80]}")
+            raise typer.Exit(1)
+        r = cleanup_orphans(console=console)
+        console.print(f"[green]✓ 清理孤儿 {r['removed']} 条[/green]")
+        return
+
+    if published:
+        pubs = find_published_entries()
+        if not pubs:
+            console.print("[green]没有 published 条目[/green]")
+            return
+        if not yes:
+            console.print(f"[yellow]将从 hashes.yaml 删除 {len(pubs)} 条 published 条目。加 --yes 确认[/yellow]")
+            for p in pubs[:5]:
+                console.print(f"  {p['source_hash'][:8]}  {p.get('source_path', p.get('source_url',''))[:80]}")
+            raise typer.Exit(1)
+        hashes = _load_hashes()
+        removed = 0
+        for p in pubs:
+            sha = p["source_hash"]
+            cleanup_source(sha, console=console)  # 防御性：清残留
+            if sha in hashes:
+                del hashes[sha]
+                removed += 1
+        _save_hashes(hashes)
+        console.print(f"[green]✓ 删除 {removed} 条 published 条目[/green]")
+        return
+
+    if wipe:
+        if not yes:
+            stats = cache_stats()
+            console.print(
+                f"[red]⚠ 将清空全部缓存："
+                f"raw {stats['raw_files']} / extract {stats['extract_files']} / "
+                f"drafts {stats['drafts_total']} / hashes.yaml[/red]"
+            )
+            if include_repos:
+                console.print(f"[red]  + Git 仓库克隆 {stats['repos_clones']} 个[/red]")
+            console.print("[yellow]加 --yes 确认[/yellow]")
+            raise typer.Exit(1)
+        wipe_all_caches(console=console)
+        if include_repos:
+            wipe_repos(console=console)
+        console.print("[green]✓ 全部清空[/green]")
 
 
 # ---------------------------------------------------------------------------

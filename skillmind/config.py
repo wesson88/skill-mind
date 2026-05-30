@@ -74,6 +74,11 @@ _DEFAULT_CONFIG: dict = {
     "api_keys": {},
     "vault_dir": str(VAULT_DIR),
     "auto_approve": False,
+    # publish 之后是否自动清理该来源的 raw + extract_cache + 已发布草稿（W2.4c）
+    # 一文多卡时仅当所有卡均 published 才触发
+    "cleanup": {
+        "auto_after_publish": True,
+    },
 }
 
 # provider 前缀 → 对应的默认环境变量名

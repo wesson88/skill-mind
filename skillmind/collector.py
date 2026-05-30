@@ -206,11 +206,17 @@ def _get_commit_sha(repo_path: Path) -> str | None:
 # 列出已缓存条目
 # ---------------------------------------------------------------------------
 
-def list_cached() -> list[dict]:
-    """返回所有已缓存条目；v1 旧条目自动兜底 doc_type='skill'。"""
+def list_cached(include_published: bool = False) -> list[dict]:
+    """返回所有已缓存条目；v1 旧条目自动兜底 doc_type='skill'。
+
+    默认过滤已 publish 完毕（cleanup 后 published=true）的条目，避免出现在 extract / status
+    可处理列表中。include_published=True 仅用于 cache list 全量盘点。
+    """
     hashes = _load_hashes()
     result: list[dict] = []
     for sha, info in hashes.items():
+        if not include_published and info.get("published"):
+            continue
         info = dict(info)
         info["source_hash"] = sha
         info.setdefault("doc_type", "skill")
@@ -256,6 +262,11 @@ def _cache_web_document(
         existing_path = Path(hashes[sha].get("raw_path", str(raw_dest)))
         if not existing_path.exists():
             _atomic_write_text(existing_path, content)
+            hashes[sha]["raw_path"] = str(existing_path)
+        # 用户再次 ingest 已发布的来源 → 视为重新激活，清掉 published 标记
+        if hashes[sha].pop("published", None):
+            hashes[sha]["fetch_time"] = time.time()
+            skipped = False  # 视作"新"，触发 extract 流程
 
     info = dict(hashes[sha])
     info["source_hash"] = sha
@@ -338,9 +349,15 @@ def ingest_skill(source: str, console=None) -> list[dict]:
                 hashes_dirty = True
                 if console:
                     console.print(f"  [yellow]⚠ 缓存文件丢失，已重新复制:[/yellow] {rel_path}")
-            else:
+            # 用户重 ingest 已发布的来源 → 清 published 标记，重新进入待处理队列
+            if hashes[sha].pop("published", None):
+                hashes[sha]["fetch_time"] = time.time()
+                hashes_dirty = True
+                skipped = False
                 if console:
-                    console.print(f"  [yellow]⟳[/yellow] 跳过(已存在): {rel_path}")
+                    console.print(f"  [cyan]↻ 取消 published 标记，可重新提取:[/cyan] {rel_path}")
+            elif console and skipped:
+                console.print(f"  [yellow]⟳[/yellow] 跳过(已存在): {rel_path}")
 
         results.append({
             "raw_path": str(raw_dest),
@@ -480,8 +497,12 @@ _FORUM_PATTERNS = (
 _RSS_HINTS = ("/feed", "/rss", "/atom", "/feeds/", "/feed.xml", "/rss.xml")
 _RSS_SUFFIXES = (".xml", ".rss", ".atom")
 
-# GitHub 仓库根 URL（不含 /blob /tree /pull 等子路径）
-_GITHUB_REPO_RE = re.compile(r"^https?://(?:www\.)?github\.com/[^/]+/[^/?#]+/?(?:\?|#|$)", re.I)
+# GitHub 仓库 URL：根 + /tree/<branch>/<subpath>（ingest_skill 原生支持子目录）
+# 不匹配 /blob/...（具体文件 URL）/ /pull/ / /issues/ 等子页面
+_GITHUB_REPO_RE = re.compile(
+    r"^https?://(?:www\.)?github\.com/[^/]+/[^/?#]+(?:/tree/[^/?#]+(?:/[^?#]*)?)?/?(?:\?|#|$)",
+    re.I,
+)
 
 
 def detect_input_kind(input_str: str) -> str:
