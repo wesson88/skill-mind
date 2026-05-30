@@ -29,7 +29,7 @@ CONFIG_FILE = SKILLMIND_HOME / "config.yaml"
 # 提取缓存：同一 source_hash + prompt_version → 直接复用
 EXTRACT_CACHE_DIR = CACHE_DIR / "extract_cache"
 
-CURRENT_PROMPT_VERSION = "extract_v1"
+CURRENT_PROMPT_VERSION = "extract_v3"
 
 # ---------------------------------------------------------------------------
 # 确保目录存在
@@ -59,6 +59,16 @@ _DEFAULT_CONFIG: dict = {
         "api_key_env": "",   # 从环境变量读取 Key 的变量名
         "api_base": "",      # 自定义 API 地址（可选）
         "qpm": 10,
+        # 单次 LLM 调用的最大原文字符预算（含 <<CHUNK N>> 标记）
+        # v2 起从 6000 提到 30000，支持 Claude 200K / GPT-4 128K 等长上下文模型
+        "max_content_chars": 30000,
+    },
+    # chunker 配置：extractor 把原文交给 LLM 前的语义切分参数
+    "chunker": {
+        "chunk_size_tokens": 1500,
+        "chunk_overlap_tokens": 150,
+        "chars_per_token": 3,        # 混合中英文取 3；纯英文文档可改 4
+        "min_chunk_size_tokens": 100,
     },
     # 多 provider Key 存储区，格式: { "anthropic": "sk-ant-xxx", "openai": "sk-xxx", ... }
     "api_keys": {},

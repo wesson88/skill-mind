@@ -1,4 +1,4 @@
-"""提取引擎（Extractor）v2.2
+"""提取引擎（Extractor）v2.3 (W1)
 
 职责：将单个已缓存的原始文档转成 1~N 张结构化草稿（一文多卡）。
 
@@ -7,8 +7,15 @@
 - 一文多卡：LLM 可返回 JSON 数组，每项渲染为独立笔记。
 - 可信度 / 过时风险：source_reliability / obsolescence_risk 由 LLM 标注。
 - 提取缓存：同 (source_hash, prompt_version) 命中直接复用，避免重复消费 Token。
-- LLM 失败兜底：超时/JSON 解析失败 → 指数退避重试 → 全部失败后走启发式规则。
 - 凭证缺失（resolve_llm_credentials 抛出）属配置错误，向上抛，不静默降级。
+
+W1 新增（与 W1 计划对应）：
+- chunker 接入：原文先切分再拼回（带 <<CHUNK N>> 标记），预算从 6K 提到 30K
+- LLM 输出 JSON Schema 校验（jsonschema 已是依赖）
+- 两层重试机制：
+  * transport 层（超时/连接错误）→ 指数退避 max_retries 次（原行为）
+  * 内容层（JSON 解析/schema 校验失败）→ retry-with-feedback 一次（新增）
+- 全部失败后仍走启发式 _heuristic_extract 兜底。
 """
 
 from __future__ import annotations
@@ -19,6 +26,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
+from skillmind.chunker import Chunker, join_chunks_for_prompt
 from skillmind.config import (
     CURRENT_PROMPT_VERSION,
     EXTRACT_CACHE_DIR,
@@ -40,79 +50,163 @@ _DOC_TYPE_LABEL = {
     "webpage":    "通用网页",
 }
 
-_FOCUS_RULES: dict[str, str] = {
-    "skill": (
-        "- 着重提取严格的执行流程（procedure）、决策点（decision_points）、\n"
-        "  命令片段（procedure[].command）、前置条件、中止条件、回滚步骤。\n"
-        "- 保留作者写明的避坑提示（learning_enhancement.pain_points）。"
-    ),
-    "blog": (
-        "- 提取核心步骤、避坑指南、关键命令片段；\n"
-        "- 总结作者观点（learning_enhancement.plain_summary）；\n"
-        "- 若长文涵盖多个独立主题，按主题拆成多张卡。"
-    ),
-    "forum_post": (
-        "- 主帖：明确「问题描述」（写入 plain_summary）；\n"
-        "- 多个回答：在 procedure 或 decision_points 中对比，标记最终采纳方案；\n"
-        "- 不同方案适用条件写入 decision_points。"
-    ),
-    "webpage": (
-        "- 抽取主要概念、关键信息点，写入 learning_enhancement.knowledge_tags；\n"
-        "- 若文中含可执行命令则一并提取到 procedure。"
-    ),
-}
+# ---------------------------------------------------------------------------
+# 3 阶段 prompt 系统（W2.1）
+#
+# Stage 1 identity:    doc → cards 身份信息（name/type/intent/keywords）
+# Stage 2 structure:   doc + cards → 每张卡的骨架（procedure/decisions/halt/rollback/preconds/refs）
+# Stage 3 enhancement: doc + cards + structure → 每张卡的加值信息（summary/tags/reliability/risk）
+#
+# 设计原则：
+# - 每 stage 独立 LLM 调用，独立 schema，独立 retry-with-feedback（复用 W1）
+# - 阶段间数据流：identity 输出作为 structure/enhancement 的上下文（hybrid B 模式）
+# - 多卡决定权在 identity 阶段，后续阶段输出 N 个 units 按序对齐
+# ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
-    "你是结构化知识提取助手。你的任务是从给定文档中抽取标准化知识单元，"
+    "你是结构化知识提取助手。你的任务是从给定文档中按指定阶段抽取知识单元，"
     "并以严格 JSON 输出。\n"
     "重要：直接输出 JSON，不要附带任何解释、不要使用 Markdown 代码块包裹。"
 )
 
-_USER_PROMPT_TEMPLATE = """【任务】
-从以下{doc_type_label}中提取知识单元。
+# Focus rules: stage × doc_type 二维路由
+_STAGE_FOCUS_RULES: dict[str, dict[str, str]] = {
+    "identity": {
+        "skill": "- 文档是已经过提炼的 Skill，请忠实保留其 name 风格；type 偏 command-oriented / decision-tree。",
+        "blog":  "- 若长文涵盖多个独立主题（如「全栈 DevOps 指南」含 CI/CD、监控、部署），按主题拆成多张卡。",
+        "forum_post": "- 主帖问题为主卡；若不同回答属于明显不同方案/不同适用场景，可拆多卡。",
+        "webpage": "- 通常单卡；除非页面明显是分主题汇总（如 awesome 列表），否则不要拆。",
+    },
+    "structure": {
+        "skill": "- 严格保留作者写明的执行流程顺序、命令片段、前置条件、halt 条件、回滚动作。",
+        "blog":  "- 提取核心步骤；命令片段必须从原文照搬，不要泛化；缺失某节就留空数组。",
+        "forum_post": "- 主帖问题描述写 preconditions；多个回答方案对比写入 decision_points；最终采纳方案写 procedure。",
+        "webpage": "- 若文中含可执行命令则一并提取到 procedure，否则 procedure 留空。",
+    },
+    "enhancement": {
+        "skill": "- 可信度通常 high；过时风险按是否涉及具体版本号判断。pain_points 保留作者明确写的避坑。",
+        "blog":  "- 可信度依作者/站点判断（个人博客 low / 大型站点 medium / 官方 high）；过时风险偏 medium。",
+        "forum_post": "- 可信度通常 low（个人回答）；除非明显官方/高赞被采纳；过时风险 medium-high。",
+        "webpage": "- 按内容类型判断；概念解释 obsolescence_risk=low，版本相关 high。",
+    },
+}
 
-【提取重点】
+
+# ── Stage 1: identity ────────────────────────────────────────────────────
+
+_STAGE_IDENTITY_PROMPT = """【阶段】身份识别（identity）
+
+【任务】
+判断以下{doc_type_label}应拆成几张知识卡，并给每张卡输出身份字段。
+不要在本阶段输出 procedure / decision_points / 等结构字段，那是下一阶段的任务。
+
+【阶段聚焦】
 {focus_rules}
-
-【一文多卡】
-若文档包含多个相对独立的主题，可返回 JSON 数组（每项一张笔记）；
-否则返回单个 JSON 对象。
 
 【字段定义】
 {
-  "meta": {
-    "name": "笔记标题（简洁，<= 30 字）",
-    "type": ["command-oriented" | "concept-explanation" | "decision-tree" | "troubleshooting"],
-    "intent": "一句话目的描述",
-    "trigger_keywords": ["关键词", "..."],
-    "os": ["linux", "macos", "..."],
-    "tools_required": ["工具名", "..."]
-  },
-  "preconditions": ["前置条件", "..."],
-  "procedure": [
-    {"seq": 1, "action": "动作描述", "command": "可选命令"}
-  ],
-  "decision_points": [
-    {"condition": "判断条件", "then": "成立时", "else": "不成立时"}
-  ],
-  "halt_conditions": ["停止条件", "..."],
-  "rollback_actions": ["回滚动作", "..."],
-  "cross_references": ["[[关联笔记名]]", "..."],
-  "learning_enhancement": {
-    "pain_points": ["难点 / 避坑", "..."],
-    "plain_summary": "白话一句话总结",
-    "knowledge_tags": ["标签", "..."]
-  },
-  "source_reliability": "high | medium | low",
-  "obsolescence_risk": "low | medium | high"
+  "cards": [
+    {
+      "name": "笔记标题（简洁，<= 30 字）",
+      "type": ["command-oriented" | "concept-explanation" | "decision-tree" | "troubleshooting"],
+      "intent": "一句话目的描述",
+      "trigger_keywords": ["关键词", "..."],
+      "os": ["linux", "macos", "..."],
+      "tools_required": ["工具名", "..."]
+    }
+  ]
 }
 
-【可信度判断】
+【文档元信息】
+{metadata_json}
+
+【文档正文（doc_type={doc_type}）】
+正文以 <<CHUNK N>> 标记切分（N 为 chunk 序号），这些标记不要视为内容也不要复述。
+若文档较长，请覆盖所有 chunk 的主题，不要只看前面几个。
+
+{content}
+
+请直接输出 JSON。"""
+
+
+# ── Stage 2: structure ───────────────────────────────────────────────────
+
+_STAGE_STRUCTURE_PROMPT = """【阶段】结构骨架（structure）
+
+【任务】
+基于前一阶段已确定的卡片身份，为每张卡提取结构化骨架字段。
+卡片数量、顺序、name 严格对齐 cards_context；不要新增/删除/重排卡片。
+
+【阶段聚焦】
+{focus_rules}
+
+【前一阶段输出（cards_context）】
+{cards_json}
+
+【字段定义】
+{
+  "units": [
+    {
+      "preconditions": ["前置条件", "..."],
+      "procedure": [
+        {"seq": 1, "action": "动作描述", "command": "可选命令"}
+      ],
+      "decision_points": [
+        {"condition": "判断条件", "then": "成立时", "else": "不成立时"}
+      ],
+      "halt_conditions": ["停止条件", "..."],
+      "rollback_actions": ["回滚动作", "..."],
+      "cross_references": ["[[关联笔记名]]", "..."]
+    }
+  ]
+}
+
+units 数组顺序必须与 cards_context 一一对应。某字段在原文中不存在时保留为空数组。
+
+【文档元信息】
+{metadata_json}
+
+【文档正文（doc_type={doc_type}）】
+{content}
+
+请直接输出 JSON。"""
+
+
+# ── Stage 3: enhancement ─────────────────────────────────────────────────
+
+_STAGE_ENHANCEMENT_PROMPT = """【阶段】加值信息（enhancement）
+
+【任务】
+基于前两阶段已确定的卡片身份与结构，为每张卡补充学习增强字段、可信度与过时风险。
+units 数组顺序必须与 cards_context 一一对应。
+
+【阶段聚焦】
+{focus_rules}
+
+【前一阶段输出（cards_context）】
+{cards_json}
+
+【字段定义】
+{
+  "units": [
+    {
+      "learning_enhancement": {
+        "pain_points": ["难点 / 避坑", "..."],
+        "plain_summary": "白话一句话总结",
+        "knowledge_tags": ["标签", "..."]
+      },
+      "source_reliability": "high | medium | low",
+      "obsolescence_risk": "low | medium | high"
+    }
+  ]
+}
+
+【可信度参考】
 - high   : 官方文档、知名团队的 Skill 仓库
 - medium : 大型技术博客、活跃维护的开源项目
 - low    : 个人博客、论坛回答
 
-【过时风险】
+【过时风险参考】
 - high   : 涉及具体版本号、API 细节、易变命令
 - medium : 涉及部署流程、第三方工具
 - low    : 概念解释、设计原则
@@ -124,6 +218,15 @@ _USER_PROMPT_TEMPLATE = """【任务】
 {content}
 
 请直接输出 JSON。"""
+
+
+_STAGE_PROMPTS: dict[str, str] = {
+    "identity":    _STAGE_IDENTITY_PROMPT,
+    "structure":   _STAGE_STRUCTURE_PROMPT,
+    "enhancement": _STAGE_ENHANCEMENT_PROMPT,
+}
+
+_STAGE_ORDER: tuple[str, ...] = ("identity", "structure", "enhancement")
 
 
 # ---------------------------------------------------------------------------
@@ -139,16 +242,11 @@ def extract_skill(
     """
     对单个已缓存文档执行提取，返回草稿列表（已写盘）。
 
-    Parameters
-    ----------
-    raw_path : str
-        缓存的 .md 文件路径。
-    source_info : dict
-        list_cached() 中的一条记录，含 source_hash / doc_type / 等。
-    cfg : dict
-        全局配置（load_config()）。
-    console : rich.console.Console | None
-        可选输出。
+    流程（W2.1）：
+      1. 读取原文
+      2. _llm_extract 内部完成切分 + 3 阶段 LLM 调用（各阶段独立缓存）
+      3. 任一阶段失败 → 整篇走启发式兜底
+      4. 组装草稿落盘
     """
     ensure_dirs()
 
@@ -163,40 +261,20 @@ def extract_skill(
     doc_type = source_info.get("doc_type", "skill")
     prompt_version = CURRENT_PROMPT_VERSION
 
-    # 1. 读取原文
     text = _read_text_auto(raw_p)
 
-    # 2. 提取缓存命中（同一 hash + prompt 版本）
-    cached_units = _load_extract_cache(source_hash, prompt_version)
-    if cached_units is not None:
+    try:
+        units = _llm_extract(text, doc_type, source_info, cfg, console=console)
+    except _CredentialError:
+        raise
+    except Exception as e:
         if console:
-            console.print("  [dim]提取缓存命中，跳过 LLM 调用[/dim]")
-        units = cached_units
-    else:
-        # 3. 截断到 max_content_chars
-        max_chars = int(cfg.get("llm", {}).get("max_content_chars", 6000))
-        if len(text) > max_chars:
-            text_for_llm = text[:max_chars] + f"\n\n... (内容已截断，仅前 {max_chars} 字符)"
-        else:
-            text_for_llm = text
-
-        # 4. LLM 提取（凭证缺失向上抛，让用户配置；其他失败重试 → 启发式）
-        try:
-            units = _llm_extract(text_for_llm, doc_type, source_info, cfg, console=console)
-        except _CredentialError:
-            raise
-        except Exception as e:
-            if console:
-                console.print(f"  [yellow]⚠ LLM 提取失败，降级启发式:[/yellow] {e}")
-            units = [_heuristic_extract(text, raw_p, source_info)]
-
-        # 5. 写入提取缓存（仅 LLM/启发式新结果）
-        _save_extract_cache(source_hash, prompt_version, units)
+            console.print(f"  [yellow]⚠ LLM 提取失败，降级启发式:[/yellow] {e}")
+        units = [_heuristic_extract(text, raw_p, source_info)]
 
     if not units:
         units = [_heuristic_extract(text, raw_p, source_info)]
 
-    # 6. 组装并落盘草稿
     drafts: list[dict] = []
     total = len(units)
     for idx, unit in enumerate(units, start=1):
@@ -223,12 +301,42 @@ def _llm_extract(
     cfg: dict,
     console=None,
 ) -> list[dict]:
-    """调用 LLM 并解析 JSON。失败按 max_retries 指数退避重试。"""
+    """3 阶段编排（W2.1）：
+
+    1. chunker 切分 + 拼回带 <<CHUNK N>> 标记的字符串（送给所有 stage 共用）
+    2. identity → structure → enhancement 顺序执行
+    3. 每 stage 独立缓存（key 含 stage 名）+ 独立 retry-with-feedback
+    4. 按 card_index 合并 3 阶段输出为 list[unit]
+    """
     try:
         creds = resolve_llm_credentials(cfg)
     except RuntimeError as e:
-        # 凭证类错误明确包装，让上层不要降级
         raise _CredentialError(str(e))
+
+    source_hash = source_info.get("source_hash") or ""
+    prompt_version = CURRENT_PROMPT_VERSION
+
+    # 1. chunker（每 stage 共用同一份切分结果）
+    chunker_cfg = cfg.get("chunker", {}) or {}
+    chunker = Chunker(
+        chunk_size_tokens=int(chunker_cfg.get("chunk_size_tokens", 1500)),
+        chunk_overlap_tokens=int(chunker_cfg.get("chunk_overlap_tokens", 150)),
+        chars_per_token=int(chunker_cfg.get("chars_per_token", 3)),
+        min_chunk_size_tokens=int(chunker_cfg.get("min_chunk_size_tokens", 100)),
+    )
+    chunks = chunker.chunk(text)
+    max_chars = int(cfg.get("llm", {}).get("max_content_chars", 30000))
+    text_for_llm, truncated = join_chunks_for_prompt(chunks, max_chars)
+    if console:
+        total_tokens = sum(c["estimated_tokens"] for c in chunks)
+        console.print(
+            f"  [dim]切分: {len(chunks)} chunks, "
+            f"≈{total_tokens} tokens, 送入 LLM {len(text_for_llm)} 字符[/dim]"
+        )
+        if truncated:
+            console.print(
+                f"  [yellow]⚠ 超长文档已按 chunk 边界截尾，预算 {max_chars} 字符[/yellow]"
+            )
 
     metadata = {
         "doc_type": doc_type,
@@ -240,24 +348,220 @@ def _llm_extract(
         "published_at": source_info.get("published_at", ""),
     }
 
-    # 注意：不能用 str.format()，文档正文 text 可能含 { } （代码/JSON/Shell），
-    # 会导致 KeyError / ValueError。改用手动字符串替换，安全无副作用。
-    user_prompt = (
-        _USER_PROMPT_TEMPLATE
+    # 2. Stage 1: identity
+    identity = _run_or_load_stage(
+        stage="identity",
+        source_hash=source_hash,
+        prompt_version=prompt_version,
+        text=text_for_llm,
+        doc_type=doc_type,
+        metadata=metadata,
+        prev_context={},
+        creds=creds,
+        cfg=cfg,
+        console=console,
+    )
+    cards = identity.get("cards") or []
+    if not cards:
+        raise ValueError("identity 阶段未输出任何 cards")
+    if console:
+        names = ", ".join((c.get("name") or "?")[:20] for c in cards)
+        console.print(f"  [cyan]identity:[/cyan] {len(cards)} 卡 → {names}")
+
+    # 3. Stage 2: structure
+    structure = _run_or_load_stage(
+        stage="structure",
+        source_hash=source_hash,
+        prompt_version=prompt_version,
+        text=text_for_llm,
+        doc_type=doc_type,
+        metadata=metadata,
+        prev_context={"cards": cards},
+        creds=creds,
+        cfg=cfg,
+        console=console,
+    )
+    struct_units = structure.get("units") or []
+
+    # 4. Stage 3: enhancement
+    enhancement = _run_or_load_stage(
+        stage="enhancement",
+        source_hash=source_hash,
+        prompt_version=prompt_version,
+        text=text_for_llm,
+        doc_type=doc_type,
+        metadata=metadata,
+        prev_context={"cards": cards},
+        creds=creds,
+        cfg=cfg,
+        console=console,
+    )
+    enh_units = enhancement.get("units") or []
+
+    # 5. 合并
+    return _merge_stage_outputs(cards, struct_units, enh_units)
+
+
+def _run_or_load_stage(
+    *,
+    stage: str,
+    source_hash: str,
+    prompt_version: str,
+    text: str,
+    doc_type: str,
+    metadata: dict,
+    prev_context: dict,
+    creds: dict,
+    cfg: dict,
+    console=None,
+) -> dict:
+    """读取或运行单个阶段：缓存命中直接返回；否则调 LLM + schema 校验 + 反馈重试。
+
+    返回该阶段的原始 JSON 输出（dict）。
+    """
+    cached = _load_stage_cache(source_hash, prompt_version, stage)
+    if cached is not None:
+        if console:
+            console.print(f"  [dim]{stage}: 阶段缓存命中[/dim]")
+        return cached
+
+    base_prompt = _build_stage_prompt(
+        stage=stage,
+        text=text,
+        doc_type=doc_type,
+        metadata=metadata,
+        prev_context=prev_context,
+    )
+
+    timeout = int(cfg.get("llm", {}).get("timeout", 120))
+    max_retries = int(cfg.get("llm", {}).get("max_retries", 2))
+
+    # content 层最多两轮：第 1 轮原 prompt，第 2 轮带 schema 错误反馈
+    current_prompt = base_prompt
+    last_errors: list[str] = []
+
+    for content_attempt in range(2):
+        parsed = _transport_retry_call(
+            creds, current_prompt,
+            timeout=timeout, max_retries=max_retries, console=console,
+        )
+        # _transport_retry_call 把 dict 包装成 [dict]；stage 输出必为 dict
+        data = parsed[0] if parsed else {}
+
+        last_errors = _validate_stage(stage, data)
+        if not last_errors:
+            if content_attempt > 0 and console:
+                console.print(f"  [green]✓ {stage}: 反馈重试后 schema 校验通过[/green]")
+            _save_stage_cache(source_hash, prompt_version, stage, data)
+            return data
+
+        if content_attempt == 0:
+            if console:
+                console.print(
+                    f"  [yellow]⚠ {stage}: schema 校验失败（{len(last_errors)} 处），"
+                    "反馈给 LLM 重试一次[/yellow]"
+                )
+            current_prompt = base_prompt + (
+                f"\n\n【上一次 {stage} 输出 schema 校验失败】\n"
+                + "\n".join(f"- {e}" for e in last_errors[:10])
+                + "\n请按上述 schema 要求修正后重新输出完整 JSON，"
+                "不要省略必填字段，不要改变数据类型。"
+            )
+
+    raise ValueError(
+        f"{stage} 阶段 schema 校验在反馈重试后仍失败: {last_errors[:3]}"
+    )
+
+
+def _build_stage_prompt(
+    *,
+    stage: str,
+    text: str,
+    doc_type: str,
+    metadata: dict,
+    prev_context: dict,
+) -> str:
+    """组装某 stage 的 user_prompt，做手动字符串替换以避免 str.format 与正文 { } 冲突。"""
+    template = _STAGE_PROMPTS[stage]
+    focus_rules = _STAGE_FOCUS_RULES.get(stage, {}).get(
+        doc_type,
+        _STAGE_FOCUS_RULES.get(stage, {}).get("webpage", ""),
+    )
+
+    p = (
+        template
         .replace("{doc_type_label}", _DOC_TYPE_LABEL.get(doc_type, "文档"))
-        .replace("{focus_rules}", _FOCUS_RULES.get(doc_type, _FOCUS_RULES["webpage"]))
+        .replace("{focus_rules}", focus_rules)
         .replace("{metadata_json}", json.dumps(metadata, ensure_ascii=False))
         .replace("{doc_type}", doc_type)
         .replace("{content}", text)
     )
 
-    # 净化潜在的 surrogate / 半码字符：parser 兜底解码可能引入这些，litellm 内部
-    # encode("utf-8") 严格模式会抛 UnicodeEncodeError，错误地耗掉一次重试配额。
-    user_prompt = user_prompt.encode("utf-8", errors="replace").decode("utf-8")
+    if "{cards_json}" in p:
+        cards_brief = [
+            {
+                "name": c.get("name", ""),
+                "intent": c.get("intent", ""),
+                "type": c.get("type") or [],
+            }
+            for c in prev_context.get("cards", [])
+        ]
+        p = p.replace(
+            "{cards_json}",
+            json.dumps(cards_brief, ensure_ascii=False, indent=2),
+        )
 
-    timeout = int(cfg.get("llm", {}).get("timeout", 120))
-    max_retries = int(cfg.get("llm", {}).get("max_retries", 2))
+    # 净化潜在的 surrogate / 半码字符（litellm 严格模式下会触发 UnicodeEncodeError）
+    return p.encode("utf-8", errors="replace").decode("utf-8")
 
+
+def _merge_stage_outputs(
+    cards: list[dict],
+    struct_units: list[dict],
+    enh_units: list[dict],
+) -> list[dict]:
+    """按 card_index 合并 3 阶段输出为统一的 unit 列表。
+
+    缺位（structure / enhancement 长度短于 cards）按空字典处理，保证下游能拿到完整字段。
+    """
+    units: list[dict] = []
+    for i, card in enumerate(cards):
+        struct = struct_units[i] if i < len(struct_units) else {}
+        enh = enh_units[i] if i < len(enh_units) else {}
+        units.append({
+            "meta": {
+                "name": card.get("name", ""),
+                "type": card.get("type") or [],
+                "intent": card.get("intent", ""),
+                "trigger_keywords": card.get("trigger_keywords") or [],
+                "os": card.get("os") or [],
+                "tools_required": card.get("tools_required") or [],
+            },
+            "preconditions": struct.get("preconditions") or [],
+            "procedure": struct.get("procedure") or [],
+            "decision_points": struct.get("decision_points") or [],
+            "halt_conditions": struct.get("halt_conditions") or [],
+            "rollback_actions": struct.get("rollback_actions") or [],
+            "cross_references": struct.get("cross_references") or [],
+            "learning_enhancement": enh.get("learning_enhancement") or {},
+            "source_reliability": enh.get("source_reliability", "medium"),
+            "obsolescence_risk": enh.get("obsolescence_risk", "medium"),
+        })
+    return units
+
+
+def _transport_retry_call(
+    creds: dict,
+    user_prompt: str,
+    *,
+    timeout: int,
+    max_retries: int,
+    console=None,
+) -> list[dict]:
+    """transport 层重试：超时/连接错误/JSON 语法错误均指数退避重试。
+
+    返回 parse 出来的 list[dict]（一文多卡），还未做 schema 校验。
+    """
     last_err: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
@@ -300,6 +604,155 @@ def _llm_call_once(creds: dict, user_prompt: str, *, timeout: int) -> list[dict]
 
 
 _CODEBLOCK_RE = re.compile(r"```(?:json|JSON)?\s*\n([\s\S]{1,30000}?)```")
+
+
+# ---------------------------------------------------------------------------
+# 阶段 schema（jsonschema Draft 2020-12，W2.1）
+# ---------------------------------------------------------------------------
+# 每阶段独立 schema，additionalProperties: True 允许 LLM 多输出字段
+# _validate_against() 通用校验 entry point
+
+_TYPE_ENUM = [
+    "command-oriented",
+    "concept-explanation",
+    "decision-tree",
+    "troubleshooting",
+]
+_RELIABILITY_ENUM = ["high", "medium", "low"]
+
+
+# Stage 1: identity → {"cards": [{name, type, intent, ...}, ...]}
+_IDENTITY_SCHEMA: dict = {
+    "type": "object",
+    "required": ["cards"],
+    "properties": {
+        "cards": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "type": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": _TYPE_ENUM},
+                    },
+                    "intent": {"type": "string"},
+                    "trigger_keywords": {"type": "array", "items": {"type": "string"}},
+                    "os": {"type": "array", "items": {"type": "string"}},
+                    "tools_required": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": True,
+            },
+        }
+    },
+    "additionalProperties": True,
+}
+
+
+# Stage 2: structure → {"units": [{procedure, decision_points, ...}, ...]}
+_STRUCTURE_SCHEMA: dict = {
+    "type": "object",
+    "required": ["units"],
+    "properties": {
+        "units": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "preconditions": {"type": "array", "items": {"type": "string"}},
+                    "procedure": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "seq": {"type": "integer"},
+                                "action": {"type": "string"},
+                                "command": {"type": "string"},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "decision_points": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "condition": {"type": "string"},
+                                "then": {"type": "string"},
+                                "else": {"type": "string"},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "halt_conditions": {"type": "array", "items": {"type": "string"}},
+                    "rollback_actions": {"type": "array", "items": {"type": "string"}},
+                    "cross_references": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": True,
+            },
+        }
+    },
+    "additionalProperties": True,
+}
+
+
+# Stage 3: enhancement → {"units": [{learning_enhancement, source_reliability, obsolescence_risk}, ...]}
+_ENHANCEMENT_SCHEMA: dict = {
+    "type": "object",
+    "required": ["units"],
+    "properties": {
+        "units": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "learning_enhancement": {
+                        "type": "object",
+                        "properties": {
+                            "pain_points": {"type": "array", "items": {"type": "string"}},
+                            "plain_summary": {"type": "string"},
+                            "knowledge_tags": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "additionalProperties": True,
+                    },
+                    "source_reliability": {"enum": _RELIABILITY_ENUM},
+                    "obsolescence_risk": {"enum": _RELIABILITY_ENUM},
+                },
+                "additionalProperties": True,
+            },
+        }
+    },
+    "additionalProperties": True,
+}
+
+
+_STAGE_SCHEMAS: dict[str, dict] = {
+    "identity":    _IDENTITY_SCHEMA,
+    "structure":   _STRUCTURE_SCHEMA,
+    "enhancement": _ENHANCEMENT_SCHEMA,
+}
+
+_STAGE_VALIDATORS: dict[str, Draft202012Validator] = {
+    name: Draft202012Validator(schema) for name, schema in _STAGE_SCHEMAS.items()
+}
+
+
+def _validate_stage(stage: str, data: dict) -> list[str]:
+    """对某 stage 的 LLM 输出做 schema 校验，返回错误描述列表（空表示通过）。"""
+    if not isinstance(data, dict):
+        return [f"{stage} 响应不是 object，实际类型: {type(data).__name__}"]
+    validator = _STAGE_VALIDATORS.get(stage)
+    if validator is None:
+        return [f"未知 stage: {stage}"]
+    errors: list[str] = []
+    for err in validator.iter_errors(data):
+        path = ".".join(str(p) for p in err.absolute_path) or "<root>"
+        errors.append(f"{stage}.{path}: {err.message}")
+    return errors
 
 
 def _parse_json_response(text: str) -> list[dict]:
@@ -509,28 +962,35 @@ def _assemble_draft(
 # 提取缓存
 # ---------------------------------------------------------------------------
 
-def _extract_cache_path(source_hash: str, prompt_version: str) -> Path:
-    return EXTRACT_CACHE_DIR / f"{source_hash}_{prompt_version}.json"
+def _stage_cache_path(source_hash: str, prompt_version: str, stage: str) -> Path:
+    """W2.1：阶段缓存 key 为 (hash, prompt_version, stage)。
+
+    改任一阶段 prompt 只需重跑该阶段，其他阶段仍可复用缓存。
+    旧的 v2 顶层缓存（{hash}_{ver}.json）在 v3 升版后自然失效（prompt_version 不同）。
+    """
+    return EXTRACT_CACHE_DIR / f"{source_hash}_{prompt_version}_{stage}.json"
 
 
-def _load_extract_cache(source_hash: str, prompt_version: str) -> list[dict] | None:
-    p = _extract_cache_path(source_hash, prompt_version)
+def _load_stage_cache(source_hash: str, prompt_version: str, stage: str) -> dict | None:
+    p = _stage_cache_path(source_hash, prompt_version, stage)
     if not p.exists():
         return None
     try:
         with p.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return [u for u in data if isinstance(u, dict)] or None
+        if isinstance(data, dict):
+            return data
     except (json.JSONDecodeError, OSError):
         return None
     return None
 
 
-def _save_extract_cache(source_hash: str, prompt_version: str, units: list[dict]) -> None:
-    p = _extract_cache_path(source_hash, prompt_version)
+def _save_stage_cache(
+    source_hash: str, prompt_version: str, stage: str, data: dict,
+) -> None:
+    p = _stage_cache_path(source_hash, prompt_version, stage)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
-        json.dump(units, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
     tmp.replace(p)
