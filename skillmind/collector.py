@@ -1,25 +1,21 @@
-"""采集器（Collector）v2.4
+"""采集器（Collector）v2.2
 
-将多类来源统一缓存到 ~/.skillmind/cache/raw/，并维护 hashes.yaml：
+将四类来源统一缓存到 ~/.skillmind/cache/raw/，并维护 hashes.yaml：
 
 - ingest_skill : 本地目录 / Git 仓库 → SKILL.md            (doc_type=skill)
 - ingest_rss   : RSS / Atom Feed → 批量博客文章             (doc_type=blog)
 - ingest_url   : 单篇文章 / 博客 URL                        (doc_type=blog)
 - ingest_forum : 论坛主题帖（Discourse / Reddit / HN 等）   (doc_type=forum_post)
-- ingest_auto  : 按输入自动分派到上面 4 个之一（W2.4b 新增）
 
 设计要点：
 - 文件级去重：SHA256 内容哈希一致即跳过。
 - 原子写：hashes.yaml、raw 文件均走 tmp → replace。
 - v1 旧 hashes.yaml 条目无 doc_type，list_cached 兜底为 "skill"。
-- W2.4 起：doc_type 仅作"容器层"元信息，不再驱动 extraction 形态选择
-  （extraction 形态由 extractor.identity 阶段输出的 focus_mode 决定）。
 """
 
 from __future__ import annotations
 
 import hashlib
-import re
 import shutil
 import time
 from pathlib import Path
@@ -96,8 +92,13 @@ def _sha256_text(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def scan_local(base_dir: Path) -> Iterator[Path]:
-    """递归扫描，返回所有 SKILL.md / *.skill.md / skill.md。"""
-    patterns = ["SKILL.md", "*.skill.md", "skill.md"]
+    """递归扫描，返回所有 SKILL.md / *.skill.md / skill.md / CLAUDE.md / *.md（可配置）。"""
+    patterns = [
+        "SKILL.md", "*.skill.md", "skill.md",
+        "CLAUDE.md",   # Claude Code / vibe-coding 风格仓库
+        "AGENTS.md",   # OpenAI Codex Agent 风格
+        "GEMINI.md",   # Gemini CLI 风格
+    ]
     seen: set[Path] = set()
     for pattern in patterns:
         for p in base_dir.rglob(pattern):
@@ -142,12 +143,8 @@ def _parse_github_url(url: str) -> tuple[str, str | None]:
     return repo_root_url, None
 
 
-def clone_or_pull(repo_url: str) -> tuple[Path, str]:
-    """克隆（首次）或拉取（已存在）远端仓库。
-
-    返回 (local_path, default_branch)。
-    clone 失败时清理半克隆目录，避免下次进入 "exists" 分支拿到损坏 repo。
-    """
+def clone_or_pull(repo_url: str) -> Path:
+    """克隆（首次）或拉取（已存在）远端仓库，返回本地路径。"""
     try:
         import git as gitpython  # type: ignore
     except ImportError:
@@ -164,39 +161,16 @@ def clone_or_pull(repo_url: str) -> tuple[Path, str]:
             # 网络中断、合并冲突等：保留本地缓存，不崩溃
             import warnings
             warnings.warn(f"Git pull 失败，使用本地缓存: {e}", stacklevel=2)
-            repo = gitpython.Repo(local_path)
     else:
-        try:
-            gitpython.Repo.clone_from(repo_url, local_path, depth=1)
-        except Exception:
-            # 半 clone 目录会污染下次调用，必须彻底清理
-            shutil.rmtree(local_path, ignore_errors=True)
-            raise
-        repo = gitpython.Repo(local_path)
+        gitpython.Repo.clone_from(repo_url, local_path, depth=1)
 
-    return local_path, _detect_default_branch(repo)
-
-
-def _detect_default_branch(repo) -> str:
-    """优先取 active_branch；detached HEAD 时降级 main/master。"""
-    try:
-        return repo.active_branch.name
-    except Exception:
-        try:
-            ref_names = {r.name.split("/")[-1] for r in repo.refs}
-            for fallback in ("main", "master"):
-                if fallback in ref_names:
-                    return fallback
-        except Exception:
-            pass
-    return "main"
+    return local_path
 
 
 def _get_commit_sha(repo_path: Path) -> str | None:
-    """读取 commit sha。允许从 repo 子目录定位 .git。"""
     try:
         import git as gitpython  # type: ignore
-        repo = gitpython.Repo(repo_path, search_parent_directories=True)
+        repo = gitpython.Repo(repo_path)
         return repo.head.commit.hexsha[:8]
     except Exception:
         return None
@@ -206,17 +180,11 @@ def _get_commit_sha(repo_path: Path) -> str | None:
 # 列出已缓存条目
 # ---------------------------------------------------------------------------
 
-def list_cached(include_published: bool = False) -> list[dict]:
-    """返回所有已缓存条目；v1 旧条目自动兜底 doc_type='skill'。
-
-    默认过滤已 publish 完毕（cleanup 后 published=true）的条目，避免出现在 extract / status
-    可处理列表中。include_published=True 仅用于 cache list 全量盘点。
-    """
+def list_cached() -> list[dict]:
+    """返回所有已缓存条目；v1 旧条目自动兜底 doc_type='skill'。"""
     hashes = _load_hashes()
     result: list[dict] = []
     for sha, info in hashes.items():
-        if not include_published and info.get("published"):
-            continue
         info = dict(info)
         info["source_hash"] = sha
         info.setdefault("doc_type", "skill")
@@ -262,11 +230,6 @@ def _cache_web_document(
         existing_path = Path(hashes[sha].get("raw_path", str(raw_dest)))
         if not existing_path.exists():
             _atomic_write_text(existing_path, content)
-            hashes[sha]["raw_path"] = str(existing_path)
-        # 用户再次 ingest 已发布的来源 → 视为重新激活，清掉 published 标记
-        if hashes[sha].pop("published", None):
-            hashes[sha]["fetch_time"] = time.time()
-            skipped = False  # 视作"新"，触发 extract 流程
 
     info = dict(hashes[sha])
     info["source_hash"] = sha
@@ -293,7 +256,7 @@ def ingest_skill(source: str, console=None) -> list[dict]:
                 console.print(f"[dim]仅扫描子目录:[/dim] {subdir}")
         if console:
             console.print(f"[cyan]克隆仓库:[/cyan] {clone_url}")
-        base_dir, branch = clone_or_pull(clone_url)
+        base_dir = clone_or_pull(clone_url)
         source_repo = source  # 保留原始 URL，便于 trace 还原
         commit_sha = _get_commit_sha(base_dir)
         if subdir:
@@ -309,7 +272,6 @@ def ingest_skill(source: str, console=None) -> list[dict]:
             raise FileNotFoundError(f"路径不存在: {base_dir}")
         source_repo = str(base_dir)
         commit_sha = None
-        branch = ""  # 本地路径无分支概念
 
     skill_files = list(scan_local(base_dir))
     if console:
@@ -333,7 +295,6 @@ def ingest_skill(source: str, console=None) -> list[dict]:
                 "source_repo": source_repo,
                 "source_path": rel_path,
                 "commit_sha": commit_sha,
-                "branch": branch,
                 "fetch_time": time.time(),
                 "raw_path": str(raw_dest),
             }
@@ -349,15 +310,9 @@ def ingest_skill(source: str, console=None) -> list[dict]:
                 hashes_dirty = True
                 if console:
                     console.print(f"  [yellow]⚠ 缓存文件丢失，已重新复制:[/yellow] {rel_path}")
-            # 用户重 ingest 已发布的来源 → 清 published 标记，重新进入待处理队列
-            if hashes[sha].pop("published", None):
-                hashes[sha]["fetch_time"] = time.time()
-                hashes_dirty = True
-                skipped = False
+            else:
                 if console:
-                    console.print(f"  [cyan]↻ 取消 published 标记，可重新提取:[/cyan] {rel_path}")
-            elif console and skipped:
-                console.print(f"  [yellow]⟳[/yellow] 跳过(已存在): {rel_path}")
+                    console.print(f"  [yellow]⟳[/yellow] 跳过(已存在): {rel_path}")
 
         results.append({
             "raw_path": str(raw_dest),
@@ -365,7 +320,6 @@ def ingest_skill(source: str, console=None) -> list[dict]:
             "source_repo": source_repo,
             "source_hash": sha,
             "commit_sha": commit_sha,
-            "branch": hashes[sha].get("branch", branch),
             "fetch_time": hashes[sha].get("fetch_time", 0.0),
             "doc_type": "skill",
             "skipped": skipped,
@@ -483,99 +437,80 @@ def ingest_forum(topic_url: str, console=None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# ingest_auto：按输入模式自动分派（W2.4b）
+# ingest_auto：自动识别输入类型并分派
 # ---------------------------------------------------------------------------
 
-# 论坛模式判定
-_FORUM_PATTERNS = (
-    re.compile(r"reddit\.com/r/[^/]+/comments/", re.I),
-    re.compile(r"news\.ycombinator\.com/item\?id=\d+", re.I),
-    re.compile(r"/t/[^/]+/\d+(?:/\d+)?/?$"),   # Discourse 主题路径
-)
-
-# RSS / Atom Feed 模式
-_RSS_HINTS = ("/feed", "/rss", "/atom", "/feeds/", "/feed.xml", "/rss.xml")
-_RSS_SUFFIXES = (".xml", ".rss", ".atom")
-
-# GitHub 仓库 URL：根 + /tree/<branch>/<subpath>（ingest_skill 原生支持子目录）
-# 不匹配 /blob/...（具体文件 URL）/ /pull/ / /issues/ 等子页面
-_GITHUB_REPO_RE = re.compile(
-    r"^https?://(?:www\.)?github\.com/[^/]+/[^/?#]+(?:/tree/[^/?#]+(?:/[^?#]*)?)?/?(?:\?|#|$)",
-    re.I,
-)
-
-
-def detect_input_kind(input_str: str) -> str:
-    """探测输入类型，返回 'skill' / 'rss' / 'forum' / 'url' 之一。
-
-    优先级：本地路径 > Git 仓库根 > .git 后缀 > 论坛模式 > RSS 模式 > 通用 url
-    """
-    s = (input_str or "").strip()
-    if not s:
-        return "url"
-
-    # 1. 本地路径（绝对或相对，存在即视为 skill 容器）
-    try:
-        p = Path(s).expanduser()
-        if p.exists():
-            return "skill"
-    except (OSError, ValueError):
-        pass
-
-    # 2. *.git URL
-    if s.endswith(".git"):
-        return "skill"
-
-    # 3. github.com/user/repo 仓库根（带可选 trailing slash / query / fragment）
-    if _GITHUB_REPO_RE.match(s):
-        return "skill"
-
-    low = s.lower()
-
-    # 4. 论坛模式
-    for pat in _FORUM_PATTERNS:
-        if pat.search(s):
-            return "forum"
-
-    # 5. RSS / Atom
-    # 5a. 路径片段命中
-    for hint in _RSS_HINTS:
-        if hint in low:
-            return "rss"
-    # 5b. URL 路径以已知后缀结尾（剥 query / fragment 后判断）
-    try:
-        path = urlparse(s).path.lower()
-        if path.endswith(_RSS_SUFFIXES):
-            return "rss"
-    except (ValueError, AttributeError):
-        pass
-
-    # 6. 其他 http(s) → 单篇 URL
-    return "url"
-
-
 def ingest_auto(
-    input_str: str,
+    target: str,
     *,
     kind_override: str | None = None,
     max_items: int = 50,
     console=None,
 ) -> tuple[str, list[dict]]:
-    """按 detect_input_kind 自动分派到 ingest_skill / ingest_rss / ingest_url / ingest_forum。
-
-    返回 (实际使用的 kind, results)。kind_override 不为空时跳过自动探测。
     """
-    kind = (kind_override or detect_input_kind(input_str)).lower()
-    if kind not in ("skill", "rss", "url", "forum"):
-        raise ValueError(f"未知 ingest 类型: {kind!r}（合法值：skill / rss / url / forum）")
+    自动识别 target 类型并调用对应采集器。
 
-    if console:
-        console.print(f"[dim]auto-detect:[/dim] [bold]{kind}[/bold]  ← {input_str}")
+    返回 (kind, results)，kind 为实际使用的类型字符串：
+      'skill' | 'rss' | 'url' | 'forum'
+
+    探测规则（可被 kind_override 覆盖）：
+    1. 本地路径 / .git 结尾 / github.com 仓库根（无 feed/rss 关键词）→ skill
+    2. 含 feed/rss/atom 关键词 或 .xml/.rss/.atom 后缀 → rss
+    3. reddit.com / news.ycombinator.com / Discourse 模式 → forum
+    4. 其余 http(s) URL → url
+    """
+    kind = kind_override or _detect_kind(target)
 
     if kind == "skill":
-        return kind, ingest_skill(input_str, console=console)
-    if kind == "rss":
-        return kind, ingest_rss(input_str, console=console, max_items=max_items)
-    if kind == "forum":
-        return kind, ingest_forum(input_str, console=console)
-    return kind, ingest_url(input_str, console=console)
+        results = ingest_skill(target, console=console)
+    elif kind == "rss":
+        results = ingest_rss(target, console=console, max_items=max_items)
+    elif kind == "forum":
+        results = ingest_forum(target, console=console)
+    else:
+        kind = "url"
+        results = ingest_url(target, console=console)
+
+    return kind, results
+
+
+def _detect_kind(target: str) -> str:
+    """根据 target 字符串启发式判断采集类型。"""
+    import re as _re
+
+    t = target.lower()
+
+    # 本地路径
+    if not t.startswith(("http://", "https://", "git@", "git://")):
+        return "skill"
+
+    # RSS/Atom Feed 特征
+    rss_patterns = [
+        r"/feed/?$", r"/rss/?$", r"/atom/?$",
+        r"[?&]format=rss", r"[?&]feed=",
+        r"\.xml$", r"\.rss$", r"\.atom$",
+        r"/feeds?/", r"/rss2?/",
+    ]
+    if any(_re.search(p, t) for p in rss_patterns) or any(
+        kw in t for kw in ("feed", "rss", "atom")
+    ):
+        return "rss"
+
+    # 论坛特征
+    forum_patterns = [
+        r"reddit\.com/r/",
+        r"news\.ycombinator\.com/item",
+        r"/t/[^/]+/\d+",        # Discourse
+        r"v2ex\.com/t/\d+",
+        r"stackoverflow\.com/questions/",
+        r"segmentfault\.com/q/",
+    ]
+    if any(_re.search(p, t) for p in forum_patterns):
+        return "forum"
+
+    # GitHub 仓库根（不含 /blob/ /raw/ ）→ skill
+    if "github.com" in t and "/blob/" not in t and "/raw/" not in t:
+        return "skill"
+
+    # 其余 URL → 通用网页
+    return "url"
