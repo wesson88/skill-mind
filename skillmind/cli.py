@@ -447,17 +447,19 @@ def cache_clean_cmd(
     orphans: bool = typer.Option(False, "--orphans", help="清理孤儿条目（hashes.yaml 有记录但 raw 文件已丢失）"),
     hash_prefix: Optional[str] = typer.Option(None, "--hash", help="清理指定 source_hash（前缀匹配）"),
     all_caches: bool = typer.Option(False, "--all", help="⚠️  全清所有缓存（raw + extract + drafts + hashes.yaml）"),
+    stale: bool = typer.Option(False, "--stale", help="清理旧命名格式的 extract_cache 文件（*_structure.json 等）"),
     repos: bool = typer.Option(False, "--repos", help="同时清理克隆的 Git 仓库（--all 时也不默认清）"),
     yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认提示"),
 ):
-    """🧹 清理缓存：孤儿条目 / 指定 hash / 全清"""
+    """🧹 清理缓存：孤儿条目 / 指定 hash / 旧格式文件 / 全清"""
     from skillmind.cache_admin import (
         cleanup_orphans, cleanup_source, wipe_all_caches, wipe_repos,
         find_orphan_entries, cache_stats,
     )
     from skillmind.collector import _load_hashes
+    from skillmind.extractor import clean_stale_extract_caches
 
-    if not orphans and not hash_prefix and not all_caches:
+    if not orphans and not hash_prefix and not all_caches and not stale:
         # 默认：显示孤儿列表
         orphan_list = find_orphan_entries()
         if not orphan_list:
@@ -467,6 +469,14 @@ def cache_clean_cmd(
             for o in orphan_list:
                 console.print(f"  [dim]{o['source_hash'][:16]}[/dim]  {o.get('title','')[:60]}")
             console.print(f"\n运行 [bold]skillmind cache clean --orphans[/bold] 删除这些条目")
+        return
+
+    if stale:
+        n = clean_stale_extract_caches(console=console)
+        if n:
+            console.print(f"[green]✓ 已删除 {n} 个旧格式 extract_cache 文件[/green]")
+        else:
+            console.print("[green]✓ 没有旧格式 extract_cache 文件[/green]")
         return
 
     if all_caches:

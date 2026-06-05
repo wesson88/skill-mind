@@ -111,7 +111,11 @@ def save_config(cfg: dict) -> None:
 
 def get_vault_dir(cfg: dict | None = None) -> Path:
     cfg = cfg or load_config()
-    return Path(cfg.get("vault_dir", VAULT_DIR))
+    raw = cfg.get("vault_dir", str(VAULT_DIR))
+    # 防止 config.yaml 中意外写入了首尾空白/换行符
+    if isinstance(raw, str):
+        raw = raw.strip()
+    return Path(raw) if raw else VAULT_DIR
 
 
 # ---------------------------------------------------------------------------

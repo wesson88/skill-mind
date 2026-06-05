@@ -24,8 +24,22 @@ from skillmind.config import get_vault_dir, load_config
 # ---------------------------------------------------------------------------
 
 def _safe_filename(name: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', "-", name)
-    return name.strip("-").strip()[:80] or "unnamed"
+    """将任意字符串转为跨平台安全的文件名。
+
+    处理顺序：
+    1. 去除所有控制字符（\\n \\r \\t 及 ASCII 0-31、127）
+    2. 替换 Windows/Unix 文件名非法字符 \\ / : * ? " < > | 为 -
+    3. 折叠连续空白为单个空格，去除首尾空白和连字符
+    4. 截断至 80 字符，兜底返回 "unnamed"
+    """
+    # 1. 去除控制字符（\x00-\x1f 及 \x7f）
+    name = re.sub(r'[\x00-\x1f\x7f]', '', name)
+    # 2. 替换非法字符
+    name = re.sub(r'[\\/:*?"<>|]', '-', name)
+    # 3. 折叠连续空白
+    name = re.sub(r'\s+', ' ', name).strip().strip('-').strip()
+    # 4. 截断
+    return name[:80] or "unnamed"
 
 
 _RELIABILITY_BADGE = {
@@ -193,6 +207,28 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             lines.append(f"- {ref}")
         lines.append("")
 
+    # --- 核心概念 ---
+    key_concepts = data.get("key_concepts", [])
+    if key_concepts:
+        lines.append("## 💡 核心概念")
+        for kc in key_concepts:
+            if not isinstance(kc, dict):
+                continue
+            title = kc.get("title", "")
+            explanation = kc.get("explanation", "")
+            example = kc.get("example", "")
+            if title:
+                lines.append(f"### {title}")
+            if explanation:
+                lines.append(explanation)
+            if example:
+                lines.append("")
+                lines.append("> **示例**")
+                # 多行示例用 blockquote 包裹
+                for ex_line in example.splitlines():
+                    lines.append(f"> {ex_line}" if ex_line.strip() else ">")
+            lines.append("")
+
     # --- 环境信息 ---
     os_info = meta.get("os", [])
     tools = meta.get("tools_required", [])
@@ -228,13 +264,22 @@ def _render_source_footer(lines: list[str], source: dict, doc_type: str) -> None
         return
 
     # Git 仓库：拼接 blob URL
-    # 注意：repo_url 可能是子目录 URL（含 /tree/<branch>/subdir），需要先还原为仓库根 URL
     if repo_url and file_path:
+        import re as _re
         file_path_posix = file_path.replace("\\", "/")
         branch = source.get("branch", "main")
-        # 提取仓库根 URL（去掉 /tree/... 部分）
-        import re as _re
-        root_url = _re.sub(r"/tree/[^/]+(/.*)?$", "", repo_url.rstrip("/"))
+
+        # 如果 source_url 本身已经是指向该文件的 GitHub blob URL，直接使用，避免二次拼接
+        # 例：source_url = https://github.com/owner/repo/blob/main/skills/SKILL.md
+        if (source_url
+                and "github.com" in source_url
+                and "/blob/" in source_url
+                and source_url.rstrip("/").endswith(file_path_posix.rstrip("/"))):
+            lines.append(f"*来源：[原始 Skill]({source_url})*")
+            return
+
+        # 提取仓库根 URL：去掉 /tree/<branch>/... 或 /blob/<branch>/... 部分
+        root_url = _re.sub(r"(/tree/|/blob/)[^/]+(/.*)?$", "", repo_url.rstrip("/"))
         full_url = f"{root_url}/blob/{branch}/{file_path_posix}"
         lines.append(f"*来源：[原始 Skill]({full_url})*")
     elif repo_url:
@@ -272,7 +317,7 @@ def publish_to_vault(
 
     # 确定输出目录
     if output_dir is not None:
-        out = Path(output_dir)
+        out = Path(str(output_dir).strip())
         if not out.is_absolute():
             out = vault_dir / "skills" / out
     else:
