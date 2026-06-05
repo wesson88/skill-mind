@@ -1,8 +1,32 @@
 """提取引擎（Extractor）v2.2
 
-职责：将单个已缓存的原始文档转成 1~N 张结构化草稿（一文多卡）。
-
-设计要点（与 PRD §4.4 一致）：
+职责：将单个已缓存的原始文档转成 1~N 张结构化草稿（    "blog": (
+        "- 首先识别文章的所有 H2/H3 小节标题；若无明显标题，按自然段落主题划分内容段。\n"
+        "- 每个小节或内容段必须映射为一个 key_concept 条目（title=小节标题或推断的主题名，\n"
+        "  explanation=该段核心内容，example=代码/示例/引用）。\n"
+        "- 若文章有可执行步骤，同时填入 procedure；作者的核心观点写入 plain_summary。\n"
+        "- 若长文涵盖多个独立主题，按主题拆成多张卡。\n"
+        "- 【覆盖要求】所有小节/段落必须在 key_concepts 或 procedure 中有对应条目，不得遗漏任何段落。\n"
+        "- 【严禁幻觉】key_concepts[].title 必须来自原文真实存在的章节标题或明确命名的概念，"
+        "禁止虚构综合摘要标题。"
+    ),
+    "forum_post": (
+        "- 将主帖问题写入 plain_summary（问题描述）。\n"
+        "- 每个独立的回答/方案必须映射为一个 key_concept 条目\n"
+        "  （title=该方案核心思路的简短命名，explanation=方案详情，example=代码/命令）。\n"
+        "- 不同方案的适用条件写入 decision_points，标记最终采纳方案。\n"
+        "- 【覆盖要求】每个有实质内容的回答都必须在 key_concepts 或 decision_points 中体现。\n"
+        "- 【严禁幻觉】key_concepts[].title 必须来自原文真实存在的章节标题或明确命名的概念，"
+        "禁止虚构综合摘要标题。"
+    ),
+    "webpage": (
+        "- 识别页面的主要区块（如 Hero/Features/Pricing/FAQ 等），每个区块映射为一个 key_concept。\n"
+        "- 若页面含可执行命令或操作步骤，提取到 procedure。\n"
+        "- 页面核心价值主张写入 plain_summary，重要关键词写入 knowledge_tags。\n"
+        "- 【覆盖要求】所有主要区块必须在 key_concepts 中有对应条目，不得只提取显眼标题而忽略内容区块。\n"
+        "- 【严禁幻觉】key_concepts[].title 必须来自原文真实存在的章节标题或明确命名的概念，"
+        "禁止虚构综合摘要标题。"
+    ),RD §4.4 一致）：
 - 动态 Prompt 路由：按 doc_type 选择提取重点。
 - 一文多卡：LLM 可返回 JSON 数组，每项渲染为独立笔记。
 - 可信度 / 过时风险：source_reliability / obsolescence_risk 由 LLM 标注。
@@ -46,29 +70,38 @@ _FOCUS_RULES: dict[str, str] = {
         "- 着重提取严格的执行流程（procedure）、决策点（decision_points）、\n"
         "  命令片段（procedure[].command）、前置条件、中止条件、回滚步骤。\n"
         "- 保留作者写明的避坑提示（learning_enhancement.pain_points）。\n"
-        "- 对文档中的重要概念、设计原则、方法论提炼到 key_concepts（每项含 title / explanation / example）。"
+        "- 对文档中的重要概念、设计原则、方法论提炼到 key_concepts（每项含 title / explanation / example）。\n"
+        "- 【关键】文档中每个具名章节（如'# Reference Style DNA'、'# 2×3 Layout'、'## Visual Modes'等）\n"
+        "  必须作为独立的 key_concept 条目保留，使用原标题作为 title，禁止将多个命名章节合并为一条。\n"
+        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节标题或明确命名的概念；\n"
+        "  禁止虚构任何综合摘要条目（如'§16-22 综合规则'、'核心规则汇总'等原文中不存在的标题）。"
     ),
     "blog": (
         "- 提取核心步骤、避坑指南、关键命令片段；\n"
         "- 总结作者观点（learning_enhancement.plain_summary）；\n"
         "- 重要概念/方法写入 key_concepts；\n"
-        "- 若长文涵盖多个独立主题，按主题拆成多张卡。"
+        "- 若长文涵盖多个独立主题，按主题拆成多张卡。\n"
+        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。"
     ),
     "forum_post": (
         "- 主帖：明确「问题描述」（写入 plain_summary）；\n"
         "- 多个回答：在 procedure 或 decision_points 中对比，标记最终采纳方案；\n"
-        "- 不同方案适用条件写入 decision_points。"
+        "- 不同方案适用条件写入 decision_points。\n"
+        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。"
     ),
     "webpage": (
         "- 抽取主要概念、关键信息点，写入 learning_enhancement.knowledge_tags；\n"
-        "- 若文中含可执行命令则一并提取到 procedure。"
+        "- 若文中含可执行命令则一并提取到 procedure。\n"
+        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。"
     ),
 }
 
 _SYSTEM_PROMPT = (
     "你是结构化知识提取助手。你的任务是从给定文档中抽取标准化知识单元，"
     "并以严格 JSON 输出。\n"
-    "重要：直接输出 JSON，不要附带任何解释、不要使用 Markdown 代码块包裹。"
+    "重要：直接输出 JSON，不要附带任何解释、不要使用 Markdown 代码块包裹。\n"
+    "严禁幻觉：所有 key_concepts[].title 必须来自原文真实存在的章节标题或明确命名的概念，"
+    "禁止虚构任何原文中不存在的综合摘要、汇总或归纳性标题。"
 )
 
 _USER_PROMPT_TEMPLATE = """【任务】
@@ -102,7 +135,7 @@ _USER_PROMPT_TEMPLATE = """【任务】
   "rollback_actions": ["回滚动作", "..."],
   "cross_references": ["[[关联笔记名]]", "..."],
   "key_concepts": [
-    {"title": "概念名称", "explanation": "详细解释（100-300字）", "example": "示例或代码片段（可空字符串）"}
+    {"title": "概念/章节/方案名称（来自原文，不可虚构）", "explanation": "详细解释（100-300字）", "example": "示例或代码片段（可空字符串）"}
   ],
   "learning_enhancement": {
     "pain_points": ["难点 / 避坑", "..."],
@@ -242,6 +275,116 @@ class _CredentialError(RuntimeError):
     """LLM 凭证缺失/无效；属配置错误，不应被启发式吃掉。"""
 
 
+def _normalize_title(title: str) -> str:
+    """标准化标题用于去重比较：小写、去标点、折叠空白。"""
+    t = title.lower()
+    t = re.sub(r'[^\w\s]', '', t)   # 去标点
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+def _dedup_key_concepts(concepts: list[dict]) -> list[dict]:
+    """对 key_concepts 列表做去重，保留首次出现的条目。
+
+    去重规则（按优先级）：
+    1. 精确 title 匹配（标准化后）
+    2. 一方 title 是另一方的子串（标准化后长度差 ≤ 10 字符）
+    """
+    result: list[dict] = []
+    seen: list[str] = []  # 已见的标准化 title 列表
+
+    for kc in concepts:
+        if not isinstance(kc, dict):
+            continue
+        raw_title = kc.get("title", "")
+        norm = _normalize_title(raw_title)
+        if not norm:
+            result.append(kc)
+            continue
+
+        duplicate = False
+        for s in seen:
+            # 精确匹配
+            if norm == s:
+                duplicate = True
+                break
+            # 子串包含（短的包含在长的里，且长度差在阈值内）
+            shorter, longer = (norm, s) if len(norm) <= len(s) else (s, norm)
+            if shorter in longer and (len(longer) - len(shorter)) <= 12:
+                duplicate = True
+                break
+
+        if not duplicate:
+            seen.append(norm)
+            result.append(kc)
+
+    return result
+
+
+def _merge_units(all_units: list[dict]) -> list[dict]:
+    """跨批次合并 units：
+
+    1. 卡片级去重：meta.name 相同（标准化）→ 保留首次，但把后续卡片独有的
+       key_concepts 合并进首次卡片，避免信息丢失。
+    2. 单卡内 key_concepts 去重：同一张卡内重复条目去除。
+    3. 跨卡 key_concepts 去重：已在其他卡出现的 key_concept title 不重复出现。
+    """
+    # --- 第一步：卡片级合并 ---
+    merged: list[dict] = []
+    name_to_idx: dict[str, int] = {}  # 标准化 name → merged 中的下标
+
+    for unit in all_units:
+        name = unit.get("meta", {}).get("name", "")
+        norm_name = _normalize_title(name)
+
+        if norm_name and norm_name in name_to_idx:
+            # 已有同名卡：把新卡的 key_concepts 补充进去（新出现的）
+            existing = merged[name_to_idx[norm_name]]
+            existing_kc = existing.get("key_concepts", [])
+            new_kc = unit.get("key_concepts", [])
+            existing_kc_titles = {_normalize_title(k.get("title", "")) for k in existing_kc}
+            for kc in new_kc:
+                if _normalize_title(kc.get("title", "")) not in existing_kc_titles:
+                    existing_kc.append(kc)
+            existing["key_concepts"] = existing_kc
+        else:
+            if norm_name:
+                name_to_idx[norm_name] = len(merged)
+            merged.append(unit)
+
+    # --- 第二步：每张卡内部 key_concepts 去重 ---
+    for unit in merged:
+        kcs = unit.get("key_concepts", [])
+        if kcs:
+            unit["key_concepts"] = _dedup_key_concepts(kcs)
+
+    # --- 第三步：跨卡 key_concepts 去重（后出现的卡不重复前面卡已有的条目）---
+    global_kc_seen: list[str] = []
+    for unit in merged:
+        kcs = unit.get("key_concepts", [])
+        if not kcs:
+            continue
+        deduped = []
+        for kc in kcs:
+            norm = _normalize_title(kc.get("title", ""))
+            if not norm:
+                deduped.append(kc)
+                continue
+            # 检查是否已在全局出现
+            is_dup = False
+            for g in global_kc_seen:
+                shorter, longer = (norm, g) if len(norm) <= len(g) else (g, norm)
+                if shorter == longer or (shorter in longer and (len(longer) - len(shorter)) <= 12):
+                    is_dup = True
+                    break
+            if not is_dup:
+                global_kc_seen.append(norm)
+                deduped.append(kc)
+        unit["key_concepts"] = deduped
+
+    return merged
+
+
 def _llm_extract_chunked(
     chunks: list[dict],
     batch_chars: int,
@@ -297,16 +440,24 @@ def _llm_extract_chunked(
 
         for unit in batch_units:
             name = unit.get("meta", {}).get("name", "")
-            if name and name in seen_names:
-                continue  # 去重：同名卡片只保留首次
-            if name:
-                seen_names.add(name)
+            norm = _normalize_title(name)
+            if norm and norm in seen_names:
+                continue
+            if norm:
+                seen_names.add(norm)
             all_units.append(unit)
 
     if not all_units:
         raise RuntimeError("所有批次均提取失败")
 
-    return all_units
+    # 跨批次去重合并：卡片级 + key_concepts 级
+    merged = _merge_units(all_units)
+    if console and len(merged) < len(all_units):
+        console.print(
+            f"  [dim]合并去重：{len(all_units)} 张 → {len(merged)} 张"
+            f"（去除 {len(all_units) - len(merged)} 张重复卡片）[/dim]"
+        )
+    return merged
 
 
 def _llm_extract(
