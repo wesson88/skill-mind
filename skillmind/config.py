@@ -29,7 +29,7 @@ CONFIG_FILE = SKILLMIND_HOME / "config.yaml"
 # 提取缓存：同一 source_hash + prompt_version → 直接复用
 EXTRACT_CACHE_DIR = CACHE_DIR / "extract_cache"
 
-CURRENT_PROMPT_VERSION = "extract_v5"
+CURRENT_PROMPT_VERSION = "extract_v1"
 
 # ---------------------------------------------------------------------------
 # 确保目录存在
@@ -59,36 +59,13 @@ _DEFAULT_CONFIG: dict = {
         "api_key_env": "",   # 从环境变量读取 Key 的变量名
         "api_base": "",      # 自定义 API 地址（可选）
         "qpm": 10,
-        # 单次 LLM 调用的最大原文字符预算（含 <<CHUNK N>> 标记）
-        # v2 起从 6000 提到 30000，支持 Claude 200K / GPT-4 128K 等长上下文模型
-        "max_content_chars": 30000,
-    },
-    # chunker 配置：extractor 把原文交给 LLM 前的语义切分参数
-    "chunker": {
-        "chunk_size_tokens": 1500,
-        "chunk_overlap_tokens": 150,
-        "chars_per_token": 3,        # 混合中英文取 3；纯英文文档可改 4
-        "min_chunk_size_tokens": 100,
     },
     # 多 provider Key 存储区，格式: { "anthropic": "sk-ant-xxx", "openai": "sk-xxx", ... }
     "api_keys": {},
     "vault_dir": str(VAULT_DIR),
     "auto_approve": False,
-    # publish 之后是否自动清理该来源的 raw + extract_cache + 已发布草稿（W2.4c）
-    # 一文多卡时仅当所有卡均 published 才触发
-    "cleanup": {
-        "auto_after_publish": True,
-    },
-    # extract 阶段开关（W2.2 引入 evidence stage；W2.3 引入 reflective stage）
-    "extract": {
-        # evidence 阶段（W2.2）：第 4 个 LLM 调用，为 procedure/decision/cross_ref 标原文短引文
-        # 关闭后行为退化为 v2.4（仅 3 个 stage），节省 ~25% Token
-        "enable_evidence": True,
-        # reflective 阶段（W2.3）：第 5 个 LLM 调用，对照原文挑错，输出 quality_score + issues
-        # 默认关；低可信度来源（source_reliability=low）会自动触发（除非下行关闭）
-        "enable_reflective": False,
-        "reflective_auto_for_low": True,
-    },
+    # 输出文件命名：output_prefix 文件名前缀，如 "SM_" 或 "技能_"，空字符串表示不加前缀
+    "output_prefix": "",
 }
 
 # provider 前缀 → 对应的默认环境变量名

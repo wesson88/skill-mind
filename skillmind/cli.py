@@ -10,18 +10,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# Windows 控制台默认 codepage（cp936/cp437）无法编码 emoji 与多数 CJK 之外字符，
-# 会让 rich/typer 渲染 --help 时直接 UnicodeEncodeError 退出。
-# 必须在导入 typer/rich 前 reconfigure，否则它们会在 import 时缓存原 stdout。
-if sys.platform == "win32":
-    for _stream_name in ("stdout", "stderr"):
-        _stream = getattr(sys, _stream_name, None)
-        if _stream is not None:
-            try:
-                _stream.reconfigure(encoding="utf-8", errors="replace")
-            except (AttributeError, OSError):
-                pass
-
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -38,76 +26,13 @@ app = typer.Typer(
 # ingest 子命令组
 ingest_app = typer.Typer(
     name="ingest",
-    help="📥 采集知识来源（auto 自动分派 / skill / rss / url / forum）",
+    help="📥 采集知识来源（skill / rss / url / forum）",
     add_completion=False,
     rich_markup_mode="rich",
 )
 app.add_typer(ingest_app, name="ingest")
 
-# cache 子命令组（W2.4c）
-cache_app = typer.Typer(
-    name="cache",
-    help="🧹 缓存管理（统计与清理 raw / extract_cache / drafts）",
-    add_completion=False,
-    rich_markup_mode="rich",
-)
-app.add_typer(cache_app, name="cache")
-
-# prompts 子命令组（W2.5）
-prompts_app = typer.Typer(
-    name="prompts",
-    help="📝 Prompt 模板管理（外移到 ~/.skillmind/prompts/<stage>.yaml 后可实战调优）",
-    add_completion=False,
-    rich_markup_mode="rich",
-)
-app.add_typer(prompts_app, name="prompts")
-
 console = Console()
-
-
-# ---------------------------------------------------------------------------
-# ingest auto（W2.4b：按输入自动分派）
-# ---------------------------------------------------------------------------
-
-@ingest_app.command("auto")
-def ingest_auto_cmd(
-    target: str = typer.Argument(
-        ...,
-        help="任意输入：本地路径 / GitHub 仓库 URL / RSS Feed / 论坛帖 / 单篇文章 URL"
-    ),
-    type_override: Optional[str] = typer.Option(
-        None, "--type", "-t",
-        help="强制指定类型（skill / rss / url / forum），跳过自动探测"
-    ),
-    max_items: int = typer.Option(50, "--max", "-n", help="RSS 模式下最多抓取条目数"),
-):
-    """🤖 自动识别输入类型并分派（推荐入口）
-
-    探测规则：本地路径/.git/github.com 仓库根 → skill；含 feed/rss/atom 或 .xml/.rss/.atom 后缀 → rss；
-    reddit/HN/Discourse 模式 → forum；其它 http(s) → url。识别错可加 `--type` 强制覆盖。
-    """
-    from skillmind.collector import ingest_auto
-
-    try:
-        kind, results = ingest_auto(
-            target,
-            kind_override=type_override,
-            max_items=max_items,
-            console=console,
-        )
-    except Exception as e:
-        console.print(f"[bold red]采集失败:[/bold red] {e}")
-        raise typer.Exit(1)
-
-    new_count = sum(1 for r in results if not r.get("skipped"))
-    skip_count = sum(1 for r in results if r.get("skipped"))
-    console.print(
-        Panel(
-            f"✅ 采集完成（分派到 [bold]{kind}[/bold]）\n"
-            f"  新增: [green]{new_count}[/green]　跳过: [yellow]{skip_count}[/yellow]　合计: {len(results)}",
-            title="[bold]Auto 采集结果[/bold]", border_style="green",
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +134,44 @@ def ingest_forum_cmd(
 
     if results:
         console.print(f"[green]✓ 已缓存:[/green] {results[0].get('title', topic_url)[:60]}")
+    else:
+        console.print("[yellow]未能获取有效内容[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# ingest auto
+# ---------------------------------------------------------------------------
+
+@ingest_app.command("auto")
+def ingest_auto_cmd(
+    target: str = typer.Argument(..., help="本地路径、Git 仓库 URL、文章 URL、RSS Feed URL 等"),
+    kind: Optional[str] = typer.Option(None, "--type", "-t", help="强制指定类型：skill / rss / url / forum"),
+    max_items: int = typer.Option(50, "--max", "-n", help="RSS 模式最多抓取条目数"),
+):
+    """🤖 自动识别来源类型并采集（skill / rss / url / forum 智能路由）"""
+    from skillmind.collector import ingest_auto
+
+    try:
+        detected_kind, results = ingest_auto(
+            target, kind_override=kind, max_items=max_items, console=console
+        )
+    except Exception as e:
+        console.print(f"[bold red]采集失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+    kind_label = {
+        "skill": "📋 skill",
+        "rss":   "📡 rss",
+        "url":   "🔗 url",
+        "forum": "💬 forum",
+    }.get(detected_kind, detected_kind)
+    console.print(f"  [dim]识别类型:[/dim] {kind_label}")
+
+    if results:
+        for r in results[:3]:
+            console.print(f"  [green]✓ 已缓存:[/green] {r.get('title', target)[:60]}")
+        if len(results) > 3:
+            console.print(f"  [dim]... 共 {len(results)} 条[/dim]")
     else:
         console.print("[yellow]未能获取有效内容[/yellow]")
 
@@ -388,6 +351,8 @@ def edit(
 def publish(
     uid: Optional[str] = typer.Argument(None, help="草稿 UUID"),
     all_drafts: bool = typer.Option(False, "--all", help="发布所有 draft/approved 状态草稿"),
+    output_dir: Optional[str] = typer.Option(None, "--output-dir", "-o", help="指定输出目录（绝对路径或相对于 vault/skills/ 的子目录）"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="文件名前缀，如 SM_ 或 技能_"),
 ):
     """🚀 将审核通过的草稿发布到 Obsidian Vault"""
     from skillmind.reviewer import list_drafts, get_draft, save_draft
@@ -412,30 +377,17 @@ def publish(
         console.print("[yellow]没有待发布的草稿[/yellow]")
         return
 
-    auto_cleanup = bool(cfg.get("cleanup", {}).get("auto_after_publish", True))
-    cleaned_sources = 0
     success = 0
     for draft in targets:
         try:
             draft["status"] = "published"
-            dest = publish_to_vault(draft, cfg=cfg)
+            dest = publish_to_vault(draft, cfg=cfg, output_dir=output_dir, prefix=prefix)
             save_draft(draft)
             console.print(f"[green]✓ 已发布:[/green] {draft.get('meta',{}).get('name','')} → {dest}")
             success += 1
-
-            # W2.4c：所有卡都发布完，自动清理该来源
-            if auto_cleanup:
-                src_hash = draft.get("source", {}).get("source_hash", "")
-                if src_hash:
-                    from skillmind.cache_admin import cleanup_after_publish
-                    r = cleanup_after_publish(src_hash, console=console)
-                    if r.get("cleaned"):
-                        cleaned_sources += 1
         except Exception as e:
             console.print(f"[red]✗ 发布失败:[/red] {draft.get('uuid','')} → {e}")
 
-    if auto_cleanup and cleaned_sources:
-        console.print(f"[dim]已自动清理 {cleaned_sources} 个完成发布的来源（raw + extract_cache + 草稿）[/dim]")
     console.print(f"\n[bold green]发布完成: {success}/{len(targets)}[/bold green]")
 
     try:
@@ -571,243 +523,12 @@ def _open_local(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# cache list / cache clean（W2.4c）
-# ---------------------------------------------------------------------------
-
-def _fmt_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
-
-
-@cache_app.command("list")
-def cache_list_cmd():
-    """📊 显示缓存统计（raw / extract_cache / drafts / 孤儿 / 已发布）"""
-    from skillmind.cache_admin import cache_stats, find_orphan_entries, find_published_entries
-
-    stats = cache_stats()
-    table = Table(title="缓存全景", box=box.ROUNDED)
-    table.add_column("指标", style="bold")
-    table.add_column("数量", justify="right")
-    table.add_column("大小", justify="right", style="dim")
-
-    table.add_row("hashes.yaml 总条目", str(stats["hashes_total"]), "")
-    table.add_row("  └ 活跃（未发布）", str(stats["hashes_active"]), "")
-    table.add_row("  └ 已发布（cleanup 后保留 dedup）", f"[green]{stats['hashes_published']}[/green]", "")
-    table.add_row("  └ 孤儿（raw 缺失）", f"[yellow]{stats['hashes_orphan']}[/yellow]", "")
-    table.add_row("raw 文件", str(stats["raw_files"]), _fmt_size(stats["raw_bytes"]))
-    table.add_row("extract_cache 文件", str(stats["extract_files"]), _fmt_size(stats["extract_bytes"]))
-    table.add_row("草稿（drafts/）", str(stats["drafts_total"]), "")
-    table.add_row("Git 仓库克隆", str(stats["repos_clones"]), "")
-    console.print(table)
-
-    orphans = find_orphan_entries()
-    if orphans:
-        console.print(f"\n[yellow]孤儿条目（hashes.yaml 有但 raw 文件不存在）{len(orphans)} 条：[/yellow]")
-        for o in orphans[:5]:
-            console.print(f"  {o['source_hash'][:8]}  {o.get('source_path', o.get('source_url',''))[:80]}")
-        if len(orphans) > 5:
-            console.print(f"  [dim]... 共 {len(orphans)} 条，跑 `cache clean --orphan` 清理[/dim]")
-
-    published = find_published_entries()
-    if published:
-        console.print(f"\n[green]已发布条目（保留 dedup，raw/extract 已清）{len(published)} 条[/green]")
-
-
-@cache_app.command("clean")
-def cache_clean_cmd(
-    hash_prefix: Optional[str] = typer.Option(None, "--hash", "-H", help="按 source_hash 前缀清单条来源"),
-    orphan: bool = typer.Option(False, "--orphan", help="清孤儿条目（raw 缺失）"),
-    published: bool = typer.Option(False, "--published", help="清已发布条目（彻底删除 hashes.yaml 中标记 published 的条目）"),
-    wipe: bool = typer.Option(False, "--all", help="全清：raw + extract_cache + drafts + hashes.yaml"),
-    include_repos: bool = typer.Option(False, "--include-repos", help="搭配 --all 时一并删除 Git 克隆缓存（默认保留）"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认提示"),
-):
-    """🧹 清理缓存。必须指定 --hash / --orphan / --published / --all 之一。"""
-    from skillmind.cache_admin import (
-        cleanup_source, cleanup_orphans, find_published_entries, find_orphan_entries,
-        wipe_all_caches, wipe_repos, cache_stats,
-    )
-    from skillmind.collector import _load_hashes, _save_hashes
-
-    flags = [bool(hash_prefix), orphan, published, wipe]
-    if sum(flags) == 0:
-        console.print("[yellow]请指定 --hash / --orphan / --published / --all 之一[/yellow]")
-        raise typer.Exit(1)
-    if sum(flags) > 1:
-        console.print("[yellow]--hash / --orphan / --published / --all 互斥，请只选一个[/yellow]")
-        raise typer.Exit(1)
-
-    if hash_prefix:
-        hashes = _load_hashes()
-        matched = [sha for sha in hashes if sha.startswith(hash_prefix)]
-        if not matched:
-            console.print(f"[red]未找到匹配的 source_hash: {hash_prefix}[/red]")
-            raise typer.Exit(1)
-        if len(matched) > 1 and not yes:
-            console.print(f"[yellow]匹配到 {len(matched)} 条，加 --yes 确认全部清理[/yellow]")
-            for sha in matched[:5]:
-                info = hashes[sha]
-                console.print(f"  {sha[:8]}  {info.get('source_path', info.get('source_url',''))[:80]}")
-            raise typer.Exit(1)
-        for sha in matched:
-            cleanup_source(sha, console=console)
-            # --hash 模式下顺手把 hashes.yaml 条目也删了（彻底"忘记"该来源）
-            hashes = _load_hashes()
-            if sha in hashes:
-                del hashes[sha]
-                _save_hashes(hashes)
-        console.print(f"[green]✓ 已清理 {len(matched)} 条来源（含 hashes.yaml 条目）[/green]")
-        return
-
-    if orphan:
-        orphans = find_orphan_entries()
-        if not orphans:
-            console.print("[green]没有孤儿条目[/green]")
-            return
-        if not yes:
-            console.print(f"[yellow]将清理 {len(orphans)} 条孤儿条目。加 --yes 确认[/yellow]")
-            for o in orphans[:5]:
-                console.print(f"  {o['source_hash'][:8]}  {o.get('source_path', o.get('source_url',''))[:80]}")
-            raise typer.Exit(1)
-        r = cleanup_orphans(console=console)
-        console.print(f"[green]✓ 清理孤儿 {r['removed']} 条[/green]")
-        return
-
-    if published:
-        pubs = find_published_entries()
-        if not pubs:
-            console.print("[green]没有 published 条目[/green]")
-            return
-        if not yes:
-            console.print(f"[yellow]将从 hashes.yaml 删除 {len(pubs)} 条 published 条目。加 --yes 确认[/yellow]")
-            for p in pubs[:5]:
-                console.print(f"  {p['source_hash'][:8]}  {p.get('source_path', p.get('source_url',''))[:80]}")
-            raise typer.Exit(1)
-        hashes = _load_hashes()
-        removed = 0
-        for p in pubs:
-            sha = p["source_hash"]
-            cleanup_source(sha, console=console)  # 防御性：清残留
-            if sha in hashes:
-                del hashes[sha]
-                removed += 1
-        _save_hashes(hashes)
-        console.print(f"[green]✓ 删除 {removed} 条 published 条目[/green]")
-        return
-
-    if wipe:
-        if not yes:
-            stats = cache_stats()
-            console.print(
-                f"[red]⚠ 将清空全部缓存："
-                f"raw {stats['raw_files']} / extract {stats['extract_files']} / "
-                f"drafts {stats['drafts_total']} / hashes.yaml[/red]"
-            )
-            if include_repos:
-                console.print(f"[red]  + Git 仓库克隆 {stats['repos_clones']} 个[/red]")
-            console.print("[yellow]加 --yes 确认[/yellow]")
-            raise typer.Exit(1)
-        wipe_all_caches(console=console)
-        if include_repos:
-            wipe_repos(console=console)
-        console.print("[green]✓ 全部清空[/green]")
-
-
-# ---------------------------------------------------------------------------
-# prompts list / export / reset（W2.5）
-# ---------------------------------------------------------------------------
-
-@prompts_app.command("list")
-def prompts_list_cmd():
-    """📋 列出当前 prompt 状态（内置默认 vs 用户覆盖）"""
-    from skillmind.config import PROMPTS_DIR
-    from skillmind.extractor import _STAGE_ORDER
-
-    table = Table(title="Prompt 模板状态", box=box.ROUNDED)
-    table.add_column("Stage", style="bold")
-    table.add_column("路径")
-    table.add_column("状态")
-    for stage in _STAGE_ORDER:
-        path = PROMPTS_DIR / f"{stage}.yaml"
-        if path.exists():
-            status = f"[green]已外移（用户可编辑）[/green]"
-        else:
-            status = "[dim]使用内置默认[/dim]"
-        table.add_row(stage, str(path), status)
-    console.print(table)
-    console.print("\n[dim]提示：`skillmind prompts export` 把内置默认写到 yaml 文件供编辑[/dim]")
-
-
-@prompts_app.command("export")
-def prompts_export_cmd(
-    force: bool = typer.Option(False, "--force", "-f", help="覆盖已存在的 yaml 文件"),
-):
-    """💾 把内置 prompt 写到 ~/.skillmind/prompts/<stage>.yaml（不存在则创建）"""
-    from skillmind.extractor import export_prompts_to_yaml
-    from skillmind.config import PROMPTS_DIR
-
-    statuses = export_prompts_to_yaml(force=force)
-
-    created = [s for s, st in statuses.items() if st == "created"]
-    overwritten = [s for s, st in statuses.items() if st == "overwritten"]
-    skipped = [s for s, st in statuses.items() if st == "skipped"]
-
-    if created:
-        console.print(f"[green]✓ 新建 {len(created)} 个：[/green]{', '.join(created)}")
-    if overwritten:
-        console.print(f"[yellow]↻ 覆盖 {len(overwritten)} 个：[/yellow]{', '.join(overwritten)}")
-    if skipped:
-        console.print(
-            f"[dim]⟳ 跳过 {len(skipped)} 个（文件已存在；加 --force 覆盖）：{', '.join(skipped)}[/dim]"
-        )
-    console.print(f"\n[bold]存储位置:[/bold] {PROMPTS_DIR}")
-    console.print(
-        "[dim]提示：编辑这些 yaml 后，下次 extract 自动加载新版本；删除文件回落到代码内置默认。[/dim]"
-    )
-
-
-@prompts_app.command("reset")
-def prompts_reset_cmd(
-    stage: Optional[str] = typer.Option(None, "--stage", "-s", help="指定 stage（identity/structure/enhancement/evidence/reflective）；省略则全部"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认"),
-):
-    """🔄 删除 yaml 自定义 prompt，恢复内置默认"""
-    from skillmind.config import PROMPTS_DIR
-    from skillmind.extractor import _STAGE_ORDER
-
-    if stage and stage not in _STAGE_ORDER:
-        console.print(f"[red]未知 stage: {stage}（可选: {', '.join(_STAGE_ORDER)}）[/red]")
-        raise typer.Exit(1)
-
-    targets = [stage] if stage else list(_STAGE_ORDER)
-    existing = [s for s in targets if (PROMPTS_DIR / f"{s}.yaml").exists()]
-    if not existing:
-        console.print("[green]没有需要删除的 yaml（当前已全用内置）[/green]")
-        return
-    if not yes:
-        console.print(f"[yellow]将删除 {len(existing)} 个 yaml：{', '.join(existing)}[/yellow]")
-        console.print("[yellow]加 --yes 确认[/yellow]")
-        raise typer.Exit(1)
-    for s in existing:
-        try:
-            (PROMPTS_DIR / f"{s}.yaml").unlink()
-            console.print(f"[green]✓ 删除[/green] {s}.yaml")
-        except OSError as e:
-            console.print(f"[red]✗ 删除失败:[/red] {s}.yaml → {e}")
-
-
-# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 
 @app.command()
 def status():
     """📊 展示知识库统计信息"""
-    import re as _re
-    import yaml as _yaml
     from skillmind.reviewer import list_drafts
     from skillmind.collector import list_cached
     from skillmind.config import load_config, CURRENT_PROMPT_VERSION, get_vault_dir
@@ -817,26 +538,10 @@ def status():
     all_drafts = list_drafts()
 
     draft_count = sum(1 for d in all_drafts if d.get("status") == "draft")
+    published_count = sum(1 for d in all_drafts if d.get("status") == "published")
     approved_count = sum(1 for d in all_drafts if d.get("status") == "approved")
-
-    # W2.4c 后 auto-cleanup 会删除已发布草稿，所以 published_count 不能再依赖 drafts/。
-    # 改为扫 vault skills/ 目录里 .md 文件 + 读取 frontmatter 统计 prompt_version。
-    vault_skills = get_vault_dir(cfg) / "skills"
-    published_count = 0
-    old_prompt: list[dict] = []
-    if vault_skills.exists():
-        for note_path in vault_skills.glob("*.md"):
-            published_count += 1
-            try:
-                text = note_path.read_text(encoding="utf-8")
-                m = _re.match(r"---\n(.*?)\n---\n", text, _re.DOTALL)
-                if m:
-                    fm = _yaml.safe_load(m.group(1)) or {}
-                    pv = fm.get("prompt_version", "") or ""
-                    if pv and not pv.startswith(CURRENT_PROMPT_VERSION):
-                        old_prompt.append({"prompt_version": pv, "path": str(note_path)})
-            except (OSError, _yaml.YAMLError):
-                continue
+    old_prompt = [d for d in all_drafts if d.get("status") == "published"
+                  and not d.get("prompt_version", "").startswith(CURRENT_PROMPT_VERSION)]
 
     # 按 doc_type 统计缓存
     type_counts: dict[str, int] = {}
@@ -927,6 +632,7 @@ def config_cmd(
     api_base: Optional[str] = typer.Option(None, "--api-base", help="自定义 API 地址"),
     model: Optional[str] = typer.Option(None, "--model", help="LLM 模型，如 anthropic/claude-3-5-haiku-20241022"),
     vault: Optional[str] = typer.Option(None, "--vault", help="Obsidian Vault 目录"),
+    output_prefix: Optional[str] = typer.Option(None, "--prefix", help="默认输出文件名前缀，如 SM_ 或 技能_"),
     qpm: Optional[int] = typer.Option(None, "--qpm", help="每分钟 LLM 请求数限制"),
     show: bool = typer.Option(False, "--show", help="查看当前配置"),
     list_providers: bool = typer.Option(False, "--list-providers", help="列出所有已配置的 provider"),
@@ -975,6 +681,12 @@ def config_cmd(
     if vault:
         cfg["vault_dir"] = vault
         console.print(f"[green]✓ Vault 目录:[/green] {vault}")
+        changed = True
+
+    if output_prefix is not None:
+        cfg["output_prefix"] = output_prefix
+        label = repr(output_prefix) if output_prefix else "（无前缀）"
+        console.print(f"[green]✓ 输出文件名前缀:[/green] {label}")
         changed = True
 
     if qpm is not None:

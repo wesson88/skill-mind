@@ -23,43 +23,9 @@ from skillmind.config import get_vault_dir, load_config
 # 工具函数
 # ---------------------------------------------------------------------------
 
-# Windows 保留名（不区分大小写），即便加扩展名也不能用作文件名
-_WIN_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
-
-_BACKTICK_RUN_RE = re.compile(r"`+")
-
-
 def _safe_filename(name: str) -> str:
-    """生成跨平台安全的文件名（不含扩展名）。"""
-    # 1. 替换 Windows 非法字符
     name = re.sub(r'[\\/:*?"<>|]', "-", name)
-    # 2. 删除 ASCII 控制字符（含 \x00-\x1F 与 DEL）
-    name = "".join(c for c in name if ord(c) >= 0x20 and c != "\x7f")
-    # 3. 修剪
-    name = name.strip("-").strip()[:80] or "unnamed"
-    # 4. Windows 保留名兜底（CON / PRN / NUL / COM1...）
-    stem = name.split(".", 1)[0]
-    if stem.upper() in _WIN_RESERVED:
-        name = f"_{name}"
-    return name
-
-
-def _max_backticks_run(text: str) -> int:
-    """文本中最长的连续反引号数，用于动态选择代码围栏宽度。"""
-    return max((len(m.group()) for m in _BACKTICK_RUN_RE.finditer(text)), default=0)
-
-
-def _format_evidence_tag(source_quote: str, chunk_id) -> str:
-    """W2.2：构造原文证据标注（inline dim 短语）。无证据时返回空串。"""
-    if not source_quote:
-        return ""
-    # source_quote 转义：用反引号包住短引文以避免与 Markdown 链接 [] 冲突
-    chunk_hint = f", chunk {chunk_id}" if isinstance(chunk_id, int) and chunk_id >= 0 else ""
-    return f' <sub>≪原文: `{source_quote.strip()}`{chunk_hint}≫</sub>'
+    return name.strip("-").strip()[:80] or "unnamed"
 
 
 _RELIABILITY_BADGE = {
@@ -102,8 +68,6 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
         "uuid": data.get("uuid", ""),
         "name": meta.get("name", ""),
         "type": meta.get("type", []),
-        # W2.4：内容形态轴。procedure/decision/concept 任一；空串则不写入（cleanup 会过滤）
-        "focus_mode": meta.get("focus_mode", ""),
         "intent": meta.get("intent", ""),
         "tags": list(dict.fromkeys(t for t in tags if t)),
         "doc_type": doc_type,
@@ -115,8 +79,6 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
         "published_at": source.get("published_at", ""),
         "source_reliability": reliability,
         "obsolescence_risk": obsolescence,
-        # W2.3：reflective 阶段输出（无则被 cleanup 过滤）
-        "reflective_quality": data.get("reflective_quality", ""),
         "parent_source": source.get("parent_source", ""),
         "prompt_version": data.get("prompt_version", ""),
         "status": data.get("status", "published"),
@@ -183,19 +145,13 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             seq = step.get("seq", "")
             action = step.get("action", "")
             command = step.get("command", "")
-            # W2.2 evidence：若有 source_quote/chunk_id 则附短引文
-            quote = step.get("source_quote", "")
-            chunk_id = step.get("chunk_id")
-            quote_tag = _format_evidence_tag(quote, chunk_id)
             if command:
-                lines.append(f"{seq}. {action}{quote_tag}")
-                fence = "`" * max(3, _max_backticks_run(command) + 1)
-                lines.append(f"   {fence}")
-                for cmd_line in (command.splitlines() or [""]):
-                    lines.append(f"   {cmd_line}")
-                lines.append(f"   {fence}")
+                lines.append(f"{seq}. {action}")
+                lines.append(f"   ```")
+                lines.append(f"   {command}")
+                lines.append(f"   ```")
             else:
-                lines.append(f"{seq}. {action}{quote_tag}")
+                lines.append(f"{seq}. {action}")
         lines.append("")
 
     # --- 关键决策 ---
@@ -206,8 +162,7 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             condition = dp.get("condition", "")
             then = dp.get("then", "")
             else_ = dp.get("else", "")
-            quote_tag = _format_evidence_tag(dp.get("source_quote", ""), dp.get("chunk_id"))
-            lines.append(f"- **{condition}**{quote_tag}")
+            lines.append(f"- **{condition}**")
             if then:
                 lines.append(f"  - ✅ 是：{then}")
             if else_:
@@ -230,65 +185,12 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
             lines.append(f"- {r}")
         lines.append("")
 
-    # --- 核心概念（W2.4-fix concept 卡主承载字段）---
-    key_concepts = data.get("key_concepts", [])
-    if key_concepts:
-        lines.append("## 📖 核心概念")
-        for kc in key_concepts:
-            title = kc.get("title", "")
-            explanation = kc.get("explanation", "")
-            example = kc.get("example", "")
-            lines.append(f"### {title}")
-            if explanation:
-                lines.append(explanation)
-                lines.append("")
-            if example:
-                stripped = example.strip()
-                if stripped.startswith("```"):
-                    # 已经是完整代码块，直接保留
-                    lines.append(stripped)
-                else:
-                    # 包裹围栏；动态宽度避免被内容里的 ``` 提前闭合
-                    fence = "`" * max(3, _max_backticks_run(example) + 1)
-                    lines.append(fence)
-                    for ex_line in example.splitlines():
-                        lines.append(ex_line)
-                    lines.append(fence)
-                lines.append("")
-        lines.append("")
-
     # --- 关联知识 ---
     cross_references = data.get("cross_references", [])
     if cross_references:
         lines.append("## 🔗 关联知识")
         for ref in cross_references:
-            # W2.2：cross_references 可能是 str 或 {ref, source_quote, chunk_id}
-            if isinstance(ref, dict):
-                ref_text = ref.get("ref", "")
-                quote_tag = _format_evidence_tag(ref.get("source_quote", ""), ref.get("chunk_id"))
-                lines.append(f"- {ref_text}{quote_tag}")
-            else:
-                lines.append(f"- {ref}")
-        lines.append("")
-
-    # --- 反思发现（W2.3 reflective stage）---
-    reflective_issues = data.get("reflective_issues", [])
-    reflective_quality = data.get("reflective_quality", "")
-    if reflective_issues or reflective_quality:
-        q_badge = {"high": "🟢 高", "medium": "🟡 中", "low": "🔴 低"}.get(
-            reflective_quality, reflective_quality or "未评估"
-        )
-        lines.append(f"## 🔍 反思发现 （自评质量：{q_badge}）")
-        if not reflective_issues:
-            lines.append("- 无明显问题")
-        else:
-            for iss in reflective_issues:
-                field = iss.get("field", "")
-                issue = iss.get("issue", "")
-                suggestion = iss.get("suggestion", "")
-                lines.append(f"- **`{field}`** — {issue}")
-                if suggestion:
-                    lines.append(f"  - 建议：{suggestion}")
+            lines.append(f"- {ref}")
         lines.append("")
 
     # --- 环境信息 ---
@@ -326,11 +228,14 @@ def _render_source_footer(lines: list[str], source: dict, doc_type: str) -> None
         return
 
     # Git 仓库：拼接 blob URL
+    # 注意：repo_url 可能是子目录 URL（含 /tree/<branch>/subdir），需要先还原为仓库根 URL
     if repo_url and file_path:
         file_path_posix = file_path.replace("\\", "/")
-        # 优先用 collector 探测到的分支；缺失时 main 兜底
-        branch = source.get("branch") or "main"
-        full_url = f"{repo_url.rstrip('/')}/blob/{branch}/{file_path_posix}"
+        branch = source.get("branch", "main")
+        # 提取仓库根 URL（去掉 /tree/... 部分）
+        import re as _re
+        root_url = _re.sub(r"/tree/[^/]+(/.*)?$", "", repo_url.rstrip("/"))
+        full_url = f"{root_url}/blob/{branch}/{file_path_posix}"
         lines.append(f"*来源：[原始 Skill]({full_url})*")
     elif repo_url:
         lines.append(f"*来源：[原始仓库]({repo_url})*")
@@ -342,33 +247,53 @@ def _render_source_footer(lines: list[str], source: dict, doc_type: str) -> None
 # 发布到 Vault
 # ---------------------------------------------------------------------------
 
-def publish_to_vault(data: dict, cfg: dict | None = None) -> Path:
+def publish_to_vault(
+    data: dict,
+    cfg: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    prefix: str | None = None,
+) -> Path:
     """
     将知识单元写入 Obsidian Vault，返回写入的文件路径。
     文件写入原子化（tmp → replace）。
+
+    Parameters
+    ----------
+    output_dir : str | Path | None
+        指定输出目录。优先级高于 cfg["vault_dir"]。
+        若为相对路径，相对于 vault_dir/skills/。
+    prefix : str | None
+        文件名前缀，如 "SM_"、"技能_"。
+        优先级：参数 > cfg["output_prefix"]。
     """
     cfg = cfg or load_config()
     vault_dir = get_vault_dir(cfg)
-    published_dir = vault_dir / "skills"
-    published_dir.mkdir(parents=True, exist_ok=True)
+
+    # 确定输出目录
+    if output_dir is not None:
+        out = Path(output_dir)
+        if not out.is_absolute():
+            out = vault_dir / "skills" / out
+    else:
+        out = vault_dir / "skills"
+    out.mkdir(parents=True, exist_ok=True)
+
+    # 确定文件名前缀
+    file_prefix = prefix if prefix is not None else str(cfg.get("output_prefix", "") or "")
 
     meta_name = data.get("meta", {}).get("name", data.get("uuid", "unnamed"))
-    base = _safe_filename(meta_name)
-    dest = published_dir / f"{base}.md"
+    filename = file_prefix + _safe_filename(meta_name) + ".md"
+    dest = out / filename
 
-    # 文件名冲突时追加完整 uuid（不截前 7 位，避免空 uuid 导致 "_.md"）；
-    # 仍冲突再追加序号，循环兜底，绝不静默覆盖。
+    # 文件名冲突时追加 uuid 后缀
     if dest.exists():
-        uid = _safe_filename(data.get("uuid", "") or "anon")
-        dest = published_dir / f"{base}_{uid}.md"
-        n = 2
-        while dest.exists():
-            dest = published_dir / f"{base}_{uid}_{n}.md"
-            n += 1
+        uid_short = data.get("uuid", "")[-7:]
+        filename = file_prefix + _safe_filename(meta_name) + f"_{uid_short}.md"
+        dest = out / filename
 
     md_content = render_to_markdown(data, cfg)
 
-    # 原子写：追加 .tmp 后缀（不能用 with_suffix(".md.tmp")，那会把 .md 替换成 .tmp）
     tmp = dest.parent / (dest.name + ".tmp")
     tmp.write_text(md_content, encoding="utf-8")
     tmp.replace(dest)
