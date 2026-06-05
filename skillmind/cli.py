@@ -435,6 +435,114 @@ def search(
 
 
 # ---------------------------------------------------------------------------
+# cache
+# ---------------------------------------------------------------------------
+
+cache_app = typer.Typer(name="cache", help="🗂️ 缓存管理（孤儿清理 / 统计 / 全清）", invoke_without_command=True)
+app.add_typer(cache_app, name="cache")
+
+
+@cache_app.command("clean")
+def cache_clean_cmd(
+    orphans: bool = typer.Option(False, "--orphans", help="清理孤儿条目（hashes.yaml 有记录但 raw 文件已丢失）"),
+    hash_prefix: Optional[str] = typer.Option(None, "--hash", help="清理指定 source_hash（前缀匹配）"),
+    all_caches: bool = typer.Option(False, "--all", help="⚠️  全清所有缓存（raw + extract + drafts + hashes.yaml）"),
+    repos: bool = typer.Option(False, "--repos", help="同时清理克隆的 Git 仓库（--all 时也不默认清）"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认提示"),
+):
+    """🧹 清理缓存：孤儿条目 / 指定 hash / 全清"""
+    from skillmind.cache_admin import (
+        cleanup_orphans, cleanup_source, wipe_all_caches, wipe_repos,
+        find_orphan_entries, cache_stats,
+    )
+    from skillmind.collector import _load_hashes
+
+    if not orphans and not hash_prefix and not all_caches:
+        # 默认：显示孤儿列表
+        orphan_list = find_orphan_entries()
+        if not orphan_list:
+            console.print("[green]✓ 没有孤儿缓存条目[/green]")
+        else:
+            console.print(f"[yellow]发现 {len(orphan_list)} 个孤儿条目（hashes.yaml 有记录但 raw 文件不存在）：[/yellow]")
+            for o in orphan_list:
+                console.print(f"  [dim]{o['source_hash'][:16]}[/dim]  {o.get('title','')[:60]}")
+            console.print(f"\n运行 [bold]skillmind cache clean --orphans[/bold] 删除这些条目")
+        return
+
+    if all_caches:
+        if not yes:
+            confirm = typer.confirm("⚠️  将清除全部 raw / extract / drafts / hashes.yaml，确认？")
+            if not confirm:
+                raise typer.Abort()
+        stats = wipe_all_caches(console=console)
+        console.print(f"[bold green]全清完成：[/bold green]raw {stats['raw']} / extract {stats['extract']} / drafts {stats['drafts']}")
+        if repos:
+            r = wipe_repos(console=console)
+            console.print(f"[green]克隆仓库已清理：{r['removed']} 个[/green]")
+        return
+
+    if orphans:
+        orphan_list = find_orphan_entries()
+        if not orphan_list:
+            console.print("[green]✓ 没有孤儿缓存条目[/green]")
+            return
+        console.print(f"[yellow]清理 {len(orphan_list)} 个孤儿条目...[/yellow]")
+        result = cleanup_orphans(console=console)
+        console.print(f"[green]✓ 已清理 {result['removed']} 个孤儿条目[/green]")
+        return
+
+    if hash_prefix:
+        hashes = _load_hashes()
+        matched = [sha for sha in hashes if sha.startswith(hash_prefix)]
+        if not matched:
+            console.print(f"[red]未找到匹配的 hash：{hash_prefix}[/red]")
+            raise typer.Exit(1)
+        if len(matched) > 1 and not yes:
+            console.print(f"[yellow]匹配到 {len(matched)} 个 hash：[/yellow]")
+            for sha in matched:
+                console.print(f"  {sha[:16]}  {hashes[sha].get('title','')[:50]}")
+            confirm = typer.confirm("确认全部清理？")
+            if not confirm:
+                raise typer.Abort()
+        for sha in matched:
+            cleanup_source(sha, console=console)
+        console.print(f"[green]✓ 已清理 {len(matched)} 个 hash[/green]")
+
+
+@cache_app.command("stats")
+def cache_stats_cmd():
+    """📊 显示缓存统计（各层文件数 / 占用大小 / 孤儿数）"""
+    from skillmind.cache_admin import cache_stats
+    from rich.table import Table
+    from rich import box
+
+    s = cache_stats()
+
+    def fmt_bytes(b: int) -> str:
+        if b < 1024:
+            return f"{b} B"
+        if b < 1024 ** 2:
+            return f"{b/1024:.1f} KB"
+        return f"{b/1024**2:.1f} MB"
+
+    table = Table(title="缓存统计", box=box.ROUNDED)
+    table.add_column("项目", style="bold cyan")
+    table.add_column("数量 / 大小", justify="right")
+    table.add_row("hashes.yaml 总条目", str(s["hashes_total"]))
+    table.add_row("  └ 活跃（未发布）", str(s["hashes_active"]))
+    table.add_row("  └ 已发布", str(s["hashes_published"]))
+    table.add_row("  └ ⚠️  孤儿（raw 缺失）", f"[yellow]{s['hashes_orphan']}[/yellow]" if s["hashes_orphan"] else "0")
+    table.add_row("raw 文件", f"{s['raw_files']}  ({fmt_bytes(s['raw_bytes'])})")
+    table.add_row("extract_cache 文件", f"{s['extract_files']}  ({fmt_bytes(s['extract_bytes'])})")
+    table.add_row("drafts 文件", str(s["drafts_total"]))
+    table.add_row("克隆仓库", str(s["repos_clones"]))
+    console.print(table)
+
+    if s["hashes_orphan"]:
+        console.print(f"\n[yellow]💡 有 {s['hashes_orphan']} 个孤儿条目，运行:[/yellow] skillmind cache clean --orphans")
+
+
+# ---------------------------------------------------------------------------
 # sync
 # ---------------------------------------------------------------------------
 

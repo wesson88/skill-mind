@@ -241,11 +241,78 @@ def _cache_web_document(
 # ingest_skill：本地目录 / Git 仓库
 # ---------------------------------------------------------------------------
 
+def _ingest_single_raw_url(raw_url: str, *, source_url: str, source_repo: str,
+                            hashes: dict, console=None) -> list[dict]:
+    """下载单个 raw 文件（如 GitHub raw URL）并缓存为 skill 条目。"""
+    import httpx as _httpx
+    try:
+        resp = _httpx.get(raw_url, follow_redirects=True, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"下载 raw 文件失败: {raw_url}\n{e}")
+
+    content = resp.text
+    sha = hashlib.sha256(content.encode()).hexdigest()
+
+    if sha in hashes:
+        if console:
+            console.print(f"  [yellow]⟳ 已存在（内容未变），跳过:[/yellow] {raw_url.split('/')[-1]}")
+        h = hashes[sha]
+        raw_dest = Path(h.get("raw_path") or str(RAW_DIR / sha[:2] / f"{sha}.md"))
+        return [{**h, "source_hash": sha, "raw_path": str(raw_dest)}]
+
+    raw_dest = RAW_DIR / sha[:2] / f"{sha}.md"
+    raw_dest.parent.mkdir(parents=True, exist_ok=True)
+    raw_dest.write_text(content, encoding="utf-8")
+
+    # 从 raw_url 解析 source_path
+    # raw.githubusercontent.com/owner/repo/branch/path/SKILL.md
+    path_parts = urlparse(raw_url).path.strip("/").split("/")
+    source_path = "/".join(path_parts[3:]) if len(path_parts) > 3 else path_parts[-1]
+
+    entry = {
+        "doc_type": "skill",
+        "source_repo": source_repo,
+        "source_url": source_url,
+        "source_path": source_path,
+        "commit_sha": None,
+        "fetch_time": time.time(),
+        "raw_path": str(raw_dest),
+        "title": source_path.split("/")[-1],
+        "author": "",
+        "published_at": "",
+    }
+    hashes[sha] = entry
+    _save_hashes(hashes)
+
+    if console:
+        console.print(f"  [green]✓ 已缓存:[/green] {source_path}")
+    return [{**entry, "source_hash": sha}]
+
+
 def ingest_skill(source: str, console=None) -> list[dict]:
     """采集 SKILL.md（doc_type=skill）。source 支持本地路径或 Git URL。"""
     ensure_dirs()
     hashes = _load_hashes()
     results: list[dict] = []
+
+    # GitHub blob URL（单文件）→ 转为 raw URL 直接下载，无需克隆仓库
+    # https://github.com/owner/repo/blob/main/path/SKILL.md
+    # → https://raw.githubusercontent.com/owner/repo/main/path/SKILL.md
+    parsed_check = urlparse(source)
+    if (parsed_check.scheme in ("http", "https")
+            and "github.com" in parsed_check.netloc
+            and "/blob/" in parsed_check.path):
+        raw_url = (
+            source
+            .replace("github.com", "raw.githubusercontent.com", 1)
+            .replace("/blob/", "/", 1)
+        )
+        if console:
+            console.print(f"[dim]检测到 GitHub blob URL，转为 raw 下载:[/dim] {raw_url}")
+        return _ingest_single_raw_url(raw_url, source_url=source,
+                                      source_repo=source, hashes=hashes,
+                                      console=console)
 
     parsed = urlparse(source)
     if parsed.scheme in ("http", "https", "git"):
@@ -511,6 +578,15 @@ def _detect_kind(target: str) -> str:
     # GitHub 仓库根（不含 /blob/ /raw/ ）→ skill
     if "github.com" in t and "/blob/" not in t and "/raw/" not in t:
         return "skill"
+
+    # GitHub blob/raw 链接，且路径末尾是已知 skill 文件名 → skill
+    # 例：https://github.com/owner/repo/blob/main/skills/SKILL.md
+    #     https://github.com/owner/repo/raw/main/CLAUDE.md
+    _SKILL_FILENAMES = ("skill.md", "claude.md", "agents.md", "gemini.md", "prompt.md")
+    if "github.com" in t and ("/blob/" in t or "/raw/" in t):
+        path_part = t.split("github.com", 1)[-1]
+        if any(path_part.endswith(fn) for fn in _SKILL_FILENAMES):
+            return "skill"
 
     # 其余 URL → 通用网页
     return "url"
