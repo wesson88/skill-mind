@@ -530,6 +530,7 @@ def _llm_call_once(creds: dict, user_prompt: str, *, timeout: int) -> list[dict]
         "temperature": 0.2,
         "api_key": creds["api_key"],
         "timeout": timeout,
+        "max_tokens": 8192,   # 防止响应被截断导致 JSON 残缺
     }
     if "api_base" in creds:
         kwargs["api_base"] = creds["api_base"]
@@ -542,8 +543,63 @@ def _llm_call_once(creds: dict, user_prompt: str, *, timeout: int) -> list[dict]
 _CODEBLOCK_RE = re.compile(r"```(?:json|JSON)?\s*\n([\s\S]{1,30000}?)```")
 
 
+def _fix_truncated_json(text: str) -> str:
+    """尝试修复被截断的 JSON 字符串。
+
+    常见场景：LLM 在 max_tokens 处被截断，导致 JSON 末尾缺少 `}]` 等。
+    策略：找到最后一个完整的 `}` 位置，补全缺失的 `]` 或 `}`。
+    """
+    text = text.strip()
+    if not text:
+        return text
+
+    # 如果已经是合法 JSON 就直接返回
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        pass
+
+    # 找最后一个完整对象结束符 }
+    last_brace = text.rfind("}")
+    if last_brace < 0:
+        return text
+
+    truncated = text[:last_brace + 1]
+
+    # 统计未闭合的 [ 和 { 数量（简单计数，忽略字符串内的括号）
+    depth_square = 0
+    depth_curly = 0
+    in_string = False
+    escape = False
+    for ch in truncated:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "[":
+            depth_square += 1
+        elif ch == "]":
+            depth_square -= 1
+        elif ch == "{":
+            depth_curly += 1
+        elif ch == "}":
+            depth_curly -= 1
+
+    # 补全未闭合的括号
+    suffix = "}" * max(0, depth_curly) + "]" * max(0, depth_square)
+    return truncated + suffix
+
+
 def _parse_json_response(text: str) -> list[dict]:
-    """剥离可能的 ``` 包裹，解析为 list[dict]。防回溯：限制匹配长度上限。"""
+    """剥离可能的 ``` 包裹，解析为 list[dict]。含截断修复。"""
     text = text.strip()
     # 截断超长响应，防止正则回溯地狱（LLM 偶尔返回超大文本）
     if len(text) > 32000:
@@ -565,7 +621,16 @@ def _parse_json_response(text: str) -> list[dict]:
         if last >= 0:
             text = text[:last + 1]
 
-    parsed = json.loads(text)
+    # 3. 尝试解析，失败则尝试修复截断后再解析
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        fixed = _fix_truncated_json(text)
+        try:
+            parsed = json.loads(fixed)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON 解析失败（修复后仍无效）: {e}") from e
+
     if isinstance(parsed, dict):
         return [parsed]
     if isinstance(parsed, list):

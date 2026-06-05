@@ -181,15 +181,17 @@ def ingest_auto_cmd(
 # ---------------------------------------------------------------------------
 
 @app.command()
+@app.command()
 def extract(
     skill: Optional[str] = typer.Option(None, "--skill", "-s", help="指定 source_hash 前缀或路径关键词"),
     doc_type: Optional[str] = typer.Option(None, "--type", "-t", help="只处理指定类型: skill / blog / forum_post / webpage"),
     auto_approve: bool = typer.Option(False, "--auto-approve", help="提取后自动批准草稿"),
+    rerun_all: bool = typer.Option(False, "--all", help="强制重新提取所有文档（忽略 extract_cache）"),
 ):
-    """🔬 对缓存内的文档执行 LLM 知识提取，生成草稿（支持一文多卡）"""
+    """🔬 对缓存内的文档执行 LLM 知识提取，生成草稿（默认只处理未提取过的新文档）"""
     from skillmind.collector import list_cached
-    from skillmind.extractor import extract_skill as _extract
-    from skillmind.config import load_config, get_vault_dir
+    from skillmind.extractor import extract_skill as _extract, _extract_cache_path
+    from skillmind.config import load_config, get_vault_dir, CURRENT_PROMPT_VERSION
 
     cfg = load_config()
     cached = list_cached()
@@ -210,6 +212,21 @@ def extract(
     if not cached:
         console.print(f"[red]未找到匹配的缓存文件[/red]")
         raise typer.Exit(1)
+
+    # 默认只处理没有当前版本 extract_cache 的文档
+    if not rerun_all and not skill:
+        pending = [
+            c for c in cached
+            if not _extract_cache_path(c.get("source_hash", ""), CURRENT_PROMPT_VERSION).exists()
+        ]
+        skipped = len(cached) - len(pending)
+        if skipped:
+            console.print(f"[dim]已跳过 {skipped} 个文档（extract_cache 命中），如需重跑全部请加 --all[/dim]")
+        cached = pending
+
+    if not cached:
+        console.print("[green]✓ 所有文档已是最新提取结果，无需重新提取[/green]")
+        raise typer.Exit(0)
 
     console.print(f"[cyan]共 {len(cached)} 个文件待提取[/cyan]")
     qpm = cfg.get("llm", {}).get("qpm", 10)
