@@ -66,6 +66,21 @@ _DOC_TYPE_LABEL = {
     "webpage":       "通用网页",
 }
 
+_COMMON_FIDELITY_RULES = (
+    "- 【长列表强制全保留】原文若出现连续 5 条以上的 bullet / numbered list（如 18 个组件、\n"
+    "  20 个 baseline 参数、27 项检查清单），该列表必须 verbatim 完整保留到对应 key_concept 的\n"
+    "  explanation 或 example 字段，禁止用'等'、'诸如此类'、'...'省略；宁可单条 explanation 长一些。\n"
+    "- 【数值阈值 verbatim】原文中出现的 `Choose exactly N`、`1-10 评分`、`clamp(4rem, 10vw, 15rem)`、\n"
+    "  `py-32 md:py-48`、`max-w-...` 等具体数值 / 比例 / 像素值 / 字号 / 计数，必须 verbatim 原样保留，\n"
+    "  禁止概括为'高纪律'、'若干'、'适当'等抽象表述。\n"
+    "- 【禁数字幻觉】严禁在 example、pain_points、plain_summary 中编造原文未出现的精确数字：\n"
+    "  不要凭直觉填 16px / 4:1 / 120px / 24px 等具体值；若举例需要数字，必须来自原文实际出现的数字。\n"
+    "  此约束同样适用 key_concepts[].example 字段 —— 示例段编造数字与主张段编造同样不可；\n"
+    "  原文未给数字时，example 字段宁可保留定性表述（'tiny spacing'）也不要补具体值。\n"
+    "- 【禁 wikilink 幻觉】cross_references 中的 [[xxx]] 必须是原文真实提及的关联名词；\n"
+    "  禁止为了'美化'编造 [[Anti-Generic Design Rules]] 这类原文从未出现的链接目标。"
+)
+
 _FOCUS_RULES: dict[str, str] = {
     "skill": (
         "- 着重提取严格的执行流程（procedure）、决策点（decision_points）、\n"
@@ -75,7 +90,8 @@ _FOCUS_RULES: dict[str, str] = {
         "- 【关键】文档中每个具名章节（如'# Reference Style DNA'、'# 2×3 Layout'、'## Visual Modes'等）\n"
         "  必须作为独立的 key_concept 条目保留，使用原标题作为 title，禁止将多个命名章节合并为一条。\n"
         "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节标题或明确命名的概念；\n"
-        "  禁止虚构任何综合摘要条目（如'§16-22 综合规则'、'核心规则汇总'等原文中不存在的标题）。"
+        "  禁止虚构任何综合摘要条目（如'§16-22 综合规则'、'核心规则汇总'等原文中不存在的标题）。\n"
+        + _COMMON_FIDELITY_RULES
     ),
     "design_system": (
         "- 设计系统文档的核心价值在于【视觉规则】和【设计决策】，而非操作步骤。\n"
@@ -96,18 +112,21 @@ _FOCUS_RULES: dict[str, str] = {
         "- 总结作者观点（learning_enhancement.plain_summary）；\n"
         "- 重要概念/方法写入 key_concepts；\n"
         "- 若长文涵盖多个独立主题，按主题拆成多张卡。\n"
-        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。"
+        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。\n"
+        + _COMMON_FIDELITY_RULES
     ),
     "forum_post": (
         "- 主帖：明确「问题描述」（写入 plain_summary）；\n"
         "- 多个回答：在 procedure 或 decision_points 中对比，标记最终采纳方案；\n"
         "- 不同方案适用条件写入 decision_points。\n"
-        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。"
+        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。\n"
+        + _COMMON_FIDELITY_RULES
     ),
     "webpage": (
         "- 抽取主要概念、关键信息点，写入 learning_enhancement.knowledge_tags；\n"
         "- 若文中含可执行命令则一并提取到 procedure。\n"
-        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。"
+        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节或概念，禁止虚构综合摘要标题。\n"
+        + _COMMON_FIDELITY_RULES
     ),
 }
 
@@ -135,6 +154,7 @@ _USER_PROMPT_TEMPLATE = """【任务】
     "name": "笔记标题（简洁，<= 30 字）",
     "type": ["command-oriented" | "concept-explanation" | "decision-tree" | "troubleshooting"],
     "intent": "一句话目的描述",
+    "source_description": "若原文 frontmatter 有 description: 字段，必须 verbatim 保留（含领域列表 / 触发关键词等具体内容）；若无则空字符串",
     "trigger_keywords": ["关键词", "..."],
     "os": ["linux", "macos", "..."],
     "tools_required": ["工具名", "..."]
@@ -340,15 +360,37 @@ def _dedup_key_concepts(concepts: list[dict]) -> list[dict]:
     return result
 
 
-def _merge_units(all_units: list[dict]) -> list[dict]:
+def _kc_title_set(unit: dict) -> set[str]:
+    """提取一张卡的 key_concepts 标准化 title 集合，用于卡间 Jaccard 相似度。"""
+    titles: set[str] = set()
+    for kc in unit.get("key_concepts", []) or []:
+        if not isinstance(kc, dict):
+            continue
+        norm = _normalize_title(kc.get("title", ""))
+        if norm:
+            titles.add(norm)
+    return titles
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _merge_units(all_units: list[dict], *, console=None) -> list[dict]:
     """跨批次合并 units：
 
     1. 卡片级去重：meta.name 相同（标准化）→ 保留首次，但把后续卡片独有的
        key_concepts 合并进首次卡片，避免信息丢失。
-    2. 单卡内 key_concepts 去重：同一张卡内重复条目去除。
-    3. 跨卡 key_concepts 去重：已在其他卡出现的 key_concept title 不重复出现。
+    2. 卡间内容重叠合并：不同 name 但 key_concepts 标题集 Jaccard ≥ 0.4 视为同一逻辑卡，
+       合并 key_concepts 并保留先出现的 meta（避免不同语言同义名重复保留）。
+    3. 单卡内 key_concepts 去重：同一张卡内重复条目去除。
+    4. 跨卡 key_concepts 去重：已在其他卡出现的 key_concept title 不重复出现。
     """
-    # --- 第一步：卡片级合并 ---
+    # --- 第一步：卡片级合并（同名）---
     merged: list[dict] = []
     name_to_idx: dict[str, int] = {}  # 标准化 name → merged 中的下标
 
@@ -370,6 +412,43 @@ def _merge_units(all_units: list[dict]) -> list[dict]:
             if norm_name:
                 name_to_idx[norm_name] = len(merged)
             merged.append(unit)
+
+    # --- 第一步 b：基于 key_concepts Jaccard 的卡间重叠合并 ---
+    # 处理"不同语言同义名"（如 'Brandkit Image Generation Skill' vs '品牌视觉识别设计技能'）
+    # 阈值 0.4：两张卡的 key_concept titles 集合并集中 40%+ 重合即视为同一卡
+    JACCARD_THRESHOLD = 0.4
+    merged_jc: list[dict] = []
+    kc_sets: list[set[str]] = []
+    for unit in merged:
+        cur_set = _kc_title_set(unit)
+        merged_target: int | None = None
+        if cur_set:
+            for i, prev_set in enumerate(kc_sets):
+                if _jaccard(cur_set, prev_set) >= JACCARD_THRESHOLD:
+                    merged_target = i
+                    break
+        if merged_target is None:
+            merged_jc.append(unit)
+            kc_sets.append(cur_set)
+        else:
+            # 合并：把当前卡独有的 key_concepts 补进先出现的卡
+            existing = merged_jc[merged_target]
+            existing_kc = existing.get("key_concepts", [])
+            existing_titles = {_normalize_title(k.get("title", ""))
+                               for k in existing_kc if isinstance(k, dict)}
+            for kc in unit.get("key_concepts", []) or []:
+                if isinstance(kc, dict) and _normalize_title(kc.get("title", "")) not in existing_titles:
+                    existing_kc.append(kc)
+            existing["key_concepts"] = existing_kc
+            kc_sets[merged_target] = _kc_title_set(existing)
+            if console:
+                a_name = existing.get("meta", {}).get("name", "")
+                b_name = unit.get("meta", {}).get("name", "")
+                console.print(
+                    f"  [dim]内容重叠合并：'{b_name}' → '{a_name}' "
+                    f"（Jaccard ≥ {JACCARD_THRESHOLD}）[/dim]"
+                )
+    merged = merged_jc
 
     # --- 第二步：每张卡内部 key_concepts 去重 ---
     for unit in merged:
@@ -469,8 +548,8 @@ def _llm_extract_chunked(
     if not all_units:
         raise RuntimeError("所有批次均提取失败")
 
-    # 跨批次去重合并：卡片级 + key_concepts 级
-    merged = _merge_units(all_units)
+    # 跨批次去重合并：卡片级 + key_concepts 级 + Jaccard 内容重叠合并
+    merged = _merge_units(all_units, console=console)
     if console and len(merged) < len(all_units):
         console.print(
             f"  [dim]合并去重：{len(all_units)} 张 → {len(merged)} 张"

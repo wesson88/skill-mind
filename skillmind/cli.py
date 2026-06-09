@@ -755,6 +755,93 @@ def update(
 
 
 # ---------------------------------------------------------------------------
+# audit — 覆盖率审计
+# ---------------------------------------------------------------------------
+
+@app.command()
+def audit(
+    source: str = typer.Argument(..., help="source_hash 前缀（≥ 7 位）或路径关键词"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="报告输出路径；默认打印到终端"),
+    max_extracts: int = typer.Option(10, "--max-extracts", help="最多审计的提取笔记数（一文多卡时）"),
+    vault_skills: Optional[str] = typer.Option(None, "--vault-skills", help="覆盖 vault skills 目录路径（用于审计放在非默认 vault 的笔记）"),
+):
+    """🔬 覆盖率审计：原文 vs vault 提取笔记的逐条对照报告
+
+    输出：✅ 完整 / 🟡 弱化 / ❌ 缺失 三档统计 + 覆盖率% + 幻觉检测。
+    用作 prompt_version 升级的质量回归基线。
+
+    示例：
+      skillmind audit a1b2c3d                      # 审计单个 source
+      skillmind audit brandkit --output report.md  # 路径关键词 + 写文件
+    """
+    from skillmind.auditor import audit_source, render_audit_report
+    from skillmind.config import load_config
+
+    cfg = load_config()
+
+    try:
+        with console.status(f"[cyan]正在审计 {source}...[/cyan]", spinner="dots"):
+            report = audit_source(
+                source, cfg, console=console,
+                max_extract_files=max_extracts,
+                vault_skills_override=vault_skills,
+            )
+    except Exception as e:
+        console.print(f"[red]✗ 审计失败:[/red] {e}")
+        raise typer.Exit(1)
+
+    md = render_audit_report(report)
+
+    if output:
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(md, encoding="utf-8")
+        console.print(f"[green]✓ 报告已写入:[/green] {out_path}")
+    else:
+        # 终端打印摘要 + 标记位置
+        total = max(len(report.matches), 1)
+        rate_pct = report.coverage_rate * 100
+        rate_color = "green" if rate_pct >= 85 else ("yellow" if rate_pct >= 70 else "red")
+        summary = (
+            f"原文: {report.source_title[:50]}\n"
+            f"提取笔记: {len(report.extract_files)} 篇  原文: {report.original_chars:,} 字符\n\n"
+            f"atomic 观点总数: [bold]{len(report.points)}[/bold]\n"
+            f"  ✅ 完整: [green]{report.complete_count}[/green]\n"
+            f"  🟡 弱化: [yellow]{report.weak_count}[/yellow]\n"
+            f"  ❌ 缺失: [red]{report.missing_count}[/red]\n"
+            f"  覆盖率: [{rate_color}]{rate_pct:.1f}%[/{rate_color}]\n"
+            f"  🚨 疑似幻觉: [{'red' if report.hallucinations else 'dim'}]{len(report.hallucinations)}[/]\n"
+        )
+        console.print(Panel(summary, title="[bold]覆盖率审计 — 摘要[/bold]", border_style=rate_color))
+
+        # 列前 5 条缺失和前 3 条幻觉
+        if report.missing_count:
+            console.print("\n[bold red]前 5 条缺失观点：[/bold red]")
+            shown = 0
+            by_id = {p.id: p for p in report.points}
+            for m in report.matches:
+                if m.status != "missing":
+                    continue
+                p = by_id.get(m.point_id)
+                if not p:
+                    continue
+                console.print(f"  [{p.kind}] {p.statement[:80]}")
+                shown += 1
+                if shown >= 5:
+                    break
+
+        if report.hallucinations:
+            console.print(f"\n[bold red]疑似幻觉（{len(report.hallucinations)} 条）：[/bold red]")
+            for h in report.hallucinations[:3]:
+                console.print(f"  [{h.kind}] {h.value} — {h.note}")
+                console.print(f"    位置：{h.found_in_extract[:80]}")
+
+        console.print(
+            f"\n[dim]完整报告请加 --output report.md 写入文件[/dim]"
+        )
+
+
+# ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
 

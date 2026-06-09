@@ -83,6 +83,7 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
         "name": meta.get("name", ""),
         "type": meta.get("type", []),
         "intent": meta.get("intent", ""),
+        "source_description": meta.get("source_description", ""),
         "tags": list(dict.fromkeys(t for t in tags if t)),
         "doc_type": doc_type,
         "source_url": source.get("source_url", "") or source.get("repo_url", ""),
