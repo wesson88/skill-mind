@@ -31,6 +31,7 @@ from skillmind.config import (
     REPOS_DIR,
     ensure_dirs,
 )
+from skillmind.parser import parse_sections, split_front_matter
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +99,7 @@ def scan_local(base_dir: Path) -> Iterator[Path]:
         "CLAUDE.md",   # Claude Code / vibe-coding 风格仓库
         "AGENTS.md",   # OpenAI Codex Agent 风格
         "GEMINI.md",   # Gemini CLI 风格
+        "DESIGN.md",   # 设计规范文档（如 taste-skill 等设计系统仓库）
     ]
     seen: set[Path] = set()
     for pattern in patterns:
@@ -518,17 +520,25 @@ def ingest_auto(
     自动识别 target 类型并调用对应采集器。
 
     返回 (kind, results)，kind 为实际使用的类型字符串：
-      'skill' | 'rss' | 'url' | 'forum'
+      'skill' | 'design_system' | 'rss' | 'url' | 'forum'
 
     探测规则（可被 kind_override 覆盖）：
     1. 本地路径 / .git 结尾 / github.com 仓库根（无 feed/rss 关键词）→ skill
     2. 含 feed/rss/atom 关键词 或 .xml/.rss/.atom 后缀 → rss
     3. reddit.com / news.ycombinator.com / Discourse 模式 → forum
-    4. 其余 http(s) URL → url
+    4. DESIGN.md URL → design_system（文件名模式兜底）
+    5. 其余 http(s) URL → url
+
+    采集后自动识别：
+    - 对 skill/url/forum 类型，采集后读取内容分析 section 结构，
+      自动识别真正的 doc_type（skill / design_system / blog / forum_post）
+    - 避免因文件名不规范导致错误分类
     """
     kind = kind_override or _detect_kind(target)
 
     if kind == "skill":
+        results = ingest_skill(target, console=console)
+    elif kind == "design_system":
         results = ingest_skill(target, console=console)
     elif kind == "rss":
         results = ingest_rss(target, console=console, max_items=max_items)
@@ -538,7 +548,133 @@ def ingest_auto(
         kind = "url"
         results = ingest_url(target, console=console)
 
+    # 采集后自动识别：根据内容结构确定最终 doc_type
+    if kind in ("skill", "design_system", "url", "forum"):
+        results = _auto_detect_doc_type(results, console=console)
+
     return kind, results
+
+
+# ---------------------------------------------------------------------------
+# 基于内容的 doc_type 自动识别（自举方案）
+# ---------------------------------------------------------------------------
+
+# section_type → doc_type 映射权重
+# 根据真实文档统计得出：某种 section_type 出现在某种 doc_type 中的频率
+_SECTION_TYPE_WEIGHTS: dict[str, dict[str, float]] = {
+    # skill 文档特征：有明确的 procedure、preconditions、halt_conditions
+    "skill": {
+        "procedure":       3.0,   # 有操作步骤是 skill 的核心特征
+        "preconditions":   2.5,   # 前置条件是 skill 的重要组成
+        "halt_conditions": 2.0,   # 中止条件是 skill 的重要组成
+        "rollback":        1.5,   # 回滚步骤是 skill 的补充组成
+        "decisions":       1.0,   # 决策点在 skill 中出现
+        "overview":        0.5,   # 概述在 skill 中可能出现
+        "design":          0.3,   # design 在 skill 中很少出现（设计文档除外）
+        "examples":        0.5,   # 示例在 skill 中可能出现
+    },
+    # design_system 文档特征：有 design、overview，少有 procedure
+    "design_system": {
+        "design":          3.0,   # 设计维度是 design_system 的核心
+        "overview":        1.5,   # 概述/设计理念在 design_system 中常见
+        "examples":        1.0,   # 示例在 design_system 中可能出现
+        "procedure":       0.1,   # design_system 几乎没有操作步骤
+        "preconditions":   0.1,
+        "halt_conditions": 0.5,   # 铁律/禁区在 design_system 中可能出现
+        "decisions":       0.5,   # 适用条件在 design_system 中可能出现
+    },
+    # blog 文档特征：overview + examples + notes，没有严格的 procedure
+    "blog": {
+        "overview":        2.0,   # 博客通常以概述/介绍开头
+        "examples":        1.5,   # 博客常有示例
+        "notes":           1.0,   # 博客常有提示/注意事项
+        "design":          0.5,   # 技术博客可能涉及设计讨论
+        "procedure":       0.5,   # 教程类博客有步骤，但不是严格格式
+        "preconditions":   0.3,
+    },
+    # forum_post 文档特征：overview（问题描述）+ decisions（回答）
+    "forum_post": {
+        "overview":        2.0,   # 问题描述在论坛帖中
+        "decisions":       2.0,   # 多个回答/方案在论坛帖中
+        "notes":           1.0,   # 补充说明
+        "examples":        0.5,
+    },
+}
+
+
+def detect_doc_type_by_content(content: str) -> str:
+    """
+    根据文档内容结构自动识别 doc_type。
+
+    流程：
+    1. 解析文档的 section headings，提取每个 section 的 section_type
+    2. 统计各类 section_type 出现次数
+    3. 按权重加成，计算每种 doc_type 的得分
+    4. 返回得分最高的 doc_type
+
+    兜底：如果无法识别，返回 "skill"（最常见类型）
+    """
+    if not content or not content.strip():
+        return "skill"
+
+    _, body = split_front_matter(content)
+    sections = parse_sections(body)
+
+    # 统计 section_type 频率
+    section_counts: dict[str, int] = {}
+    for sec in sections:
+        st = sec.get("section_type", "other")
+        if st == "other":
+            continue
+        section_counts[st] = section_counts.get(st, 0) + 1
+
+    if not section_counts:
+        return "skill"
+
+    # 计算每种 doc_type 的加权得分
+    doc_type_scores: dict[str, float] = {}
+    for doc_type, weights in _SECTION_TYPE_WEIGHTS.items():
+        score = 0.0
+        for section_type, count in section_counts.items():
+            weight = weights.get(section_type, 0.0)
+            score += weight * count
+        doc_type_scores[doc_type] = score
+
+    # 返回得分最高的 doc_type
+    best = max(doc_type_scores, key=doc_type_scores.get)
+    return best
+
+
+def _auto_detect_doc_type(results: list[dict], console=None) -> list[dict]:
+    """
+    对采集结果逐一读取内容，自动识别真正的 doc_type 并覆盖。
+
+    跳过条件：
+    - 结果已明确是 rss/blog 等类型（它们的识别规则不同）
+    - 没有 raw_path 或文件不存在
+    """
+    for r in results:
+        raw_path = r.get("raw_path")
+        if not raw_path:
+            continue
+        p = Path(raw_path)
+        if not p.exists():
+            continue
+
+        try:
+            content = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        detected = detect_doc_type_by_content(content)
+        original = r.get("doc_type", "skill")
+
+        if detected != original:
+            if console:
+                console.print(f"  [dim]doc_type 自动识别：{original} → {detected}[/dim]")
+            r["doc_type"] = detected
+
+    return results
 
 
 def _detect_kind(target: str) -> str:
@@ -579,14 +715,17 @@ def _detect_kind(target: str) -> str:
     if "github.com" in t and "/blob/" not in t and "/raw/" not in t:
         return "skill"
 
-    # GitHub blob/raw 链接，且路径末尾是已知 skill 文件名 → skill
-    # 例：https://github.com/owner/repo/blob/main/skills/SKILL.md
-    #     https://github.com/owner/repo/raw/main/CLAUDE.md
-    _SKILL_FILENAMES = ("skill.md", "claude.md", "agents.md", "gemini.md", "prompt.md")
-    if "github.com" in t and ("/blob/" in t or "/raw/" in t):
-        path_part = t.split("github.com", 1)[-1]
-        if any(path_part.endswith(fn) for fn in _SKILL_FILENAMES):
-            return "skill"
+    # 任何 URL 路径末尾以 .md 结尾 → skill
+    # 涵盖场景：
+    #   github.com/blob/...  raw.githubusercontent.com/...  其他域名下的 .md 文件
+    # 例：https://raw.githubusercontent.com/owner/repo/main/DESIGN.md
+    #     https://example.com/docs/SKILL.md
+    url_path = urlparse(target).path.lower().rstrip("/")
+    if url_path.endswith(".md"):
+        # DESIGN.md → 设计系统文档，单独路由
+        if url_path.endswith("/design.md") or url_path == "design.md":
+            return "design_system"
+        return "skill"
 
     # 其余 URL → 通用网页
     return "url"

@@ -59,10 +59,11 @@ from skillmind.reviewer import save_draft
 # ---------------------------------------------------------------------------
 
 _DOC_TYPE_LABEL = {
-    "skill":      "Claude Code Skill 文档",
-    "blog":       "技术博客文章",
-    "forum_post": "论坛主题帖（含问答）",
-    "webpage":    "通用网页",
+    "skill":         "Claude Code Skill 文档",
+    "design_system": "设计系统规范文档",
+    "blog":          "技术博客文章",
+    "forum_post":    "论坛主题帖（含问答）",
+    "webpage":       "通用网页",
 }
 
 _FOCUS_RULES: dict[str, str] = {
@@ -75,6 +76,20 @@ _FOCUS_RULES: dict[str, str] = {
         "  必须作为独立的 key_concept 条目保留，使用原标题作为 title，禁止将多个命名章节合并为一条。\n"
         "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节标题或明确命名的概念；\n"
         "  禁止虚构任何综合摘要条目（如'§16-22 综合规则'、'核心规则汇总'等原文中不存在的标题）。"
+    ),
+    "design_system": (
+        "- 设计系统文档的核心价值在于【视觉规则】和【设计决策】，而非操作步骤。\n"
+        "- 从文档中提取所有具名设计维度（如'Configuration Dials'、'Color Palette'、'Typography'、'Key Rules'等），\n"
+        "  每个维度作为独立的 key_concept 条目（title=维度名，explanation=该维度的规则和取值，example=具体值/示例）。\n"
+        "- 若文档含表格（如配置表、颜色表），将每行作为一条 example 纳入对应 key_concept。\n"
+        "- 若文档有'不可违反的铁律'类规则（Key Rules / Forbidden / Must Not），提取到 halt_conditions。\n"
+        "- 若文档有'适用条件'类描述，提取到 decision_points。\n"
+        "- 【关键】每个具名章节/区块必须作为独立 key_concept 条目保留，使用原标题作为 title，\n"
+        "  禁止将多个命名章节合并为一条综合摘要。\n"
+        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节/区块标题或明确命名的设计概念，\n"
+        "  禁止虚构任何综合摘要、汇总或归纳性标题（如'设计原则汇总'、'核心规范'等原文中不存在的标题）。\n"
+        "- 【一文多卡】若文档描述多个独立的可复用设计维度（如同时有色彩/字体/布局规则），\n"
+        "  可按维度拆成多张卡，每张聚焦一个维度。"
     ),
     "blog": (
         "- 提取核心步骤、避坑指南、关键命令片段；\n"
@@ -273,6 +288,10 @@ def extract_skill(
 
 class _CredentialError(RuntimeError):
     """LLM 凭证缺失/无效；属配置错误，不应被启发式吃掉。"""
+
+
+class _EmptyResponseError(ValueError):
+    """LLM 返回空数组/空对象；重试无意义，应直接降级启发式。"""
 
 
 def _normalize_title(title: str) -> str:
@@ -504,6 +523,9 @@ def _llm_extract(
             return _llm_call_once(creds, user_prompt, timeout=timeout)
         except _CredentialError:
             raise
+        except _EmptyResponseError as e:
+            # 空数组/无效结构：重试不会改变结果，直接抛出让上层降级启发式
+            raise RuntimeError(f"LLM 返回空结果，降级启发式: {e}") from e
         except Exception as e:
             last_err = e
             if attempt < max_retries:
@@ -636,7 +658,10 @@ def _parse_json_response(text: str) -> list[dict]:
     if isinstance(parsed, list):
         units = [u for u in parsed if isinstance(u, dict)]
         if not units:
-            raise ValueError("数组中没有有效对象")
+            # 空数组/全非 dict：重试无意义，直接降级启发式
+            raise _EmptyResponseError(
+                f"数组中没有有效对象（共 {len(parsed)} 项，类型：{[type(x).__name__ for x in parsed[:3]]}）"
+            )
         return units
     raise ValueError(f"LLM 响应不是 JSON 对象/数组: {type(parsed).__name__}")
 
