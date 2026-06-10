@@ -551,6 +551,11 @@ def ingest_auto(
     # 采集后自动识别：根据内容结构确定最终 doc_type
     if kind in ("skill", "design_system", "url", "forum", "rss"):
         results = _auto_detect_doc_type(results, console=console)
+        # kind 应与最终 doc_type 保持一致（便于调用方判断）
+        if results:
+            final_doc_type = results[0].get("doc_type", kind)
+            if final_doc_type != kind:
+                kind = final_doc_type
 
     return kind, results
 
