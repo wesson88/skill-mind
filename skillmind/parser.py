@@ -69,6 +69,11 @@ _SECTION_KEYWORDS: dict[str, list[str]] = {
     "overview": [
         "overview", "summary", "description", "about", "intro", "background",
         "概述", "简介", "描述", "背景", "介绍", "总览", "说明", "设计思维", "思维", "目标",
+        # 博客/文章常见章节
+        "problem", "issue", "challenge", "pain point",
+        "solution", "approach", "methodology",
+        "key insight", "core insight", "takeaway", "main point",
+        "implementation", "result", "outcome",
     ],
     "procedure": [
         "procedure", "steps", "process", "instructions", "usage", "workflow", "how to",
@@ -103,6 +108,7 @@ _SECTION_KEYWORDS: dict[str, list[str]] = {
     "notes": [
         "note", "warning", "caution", "tip", "best practice", "guideline",
         "注意", "警告", "提示", "建议", "规范", "原则", "指南", "总结",
+        "limitation", "caveat", "gotcha",
     ],
     "design": [
         "design", "aesthetic", "style", "theme", "color", "typography", "layout", "animation",

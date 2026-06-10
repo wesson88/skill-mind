@@ -549,7 +549,7 @@ def ingest_auto(
         results = ingest_url(target, console=console)
 
     # 采集后自动识别：根据内容结构确定最终 doc_type
-    if kind in ("skill", "design_system", "url", "forum"):
+    if kind in ("skill", "design_system", "url", "forum", "rss"):
         results = _auto_detect_doc_type(results, console=console)
 
     return kind, results
@@ -606,13 +606,17 @@ def detect_doc_type_by_content(content: str) -> str:
     """
     根据文档内容结构自动识别 doc_type。
 
-    流程：
-    1. 解析文档的 section headings，提取每个 section 的 section_type
-    2. 统计各类 section_type 出现次数
-    3. 按权重加成，计算每种 doc_type 的得分
-    4. 返回得分最高的 doc_type
+    阶梯式判断（优先级从高到低）：
+    1. 有 procedure + (preconditions 或 halt_conditions) → skill
+       （有明确操作步骤+执行约束，是技能文档的核心特征）
+    2. 有 design + 无 procedure → design_system
+       （有设计维度但无操作步骤，是设计系统文档）
+    3. 有 decisions + (overview 为主) → forum_post
+       （有决策/方案对比，论坛帖特征）
+    4. 按权重计算：统计 section_type 频率，按权重加成，取最高分
+    5. 兜底：无任何特征 → skill
 
-    兜底：如果无法识别，返回 "skill"（最常见类型）
+    这种阶梯式判断避免了 blog 的 overview 累积分压制 procedure 信号的问题。
     """
     if not content or not content.strip():
         return "skill"
@@ -631,7 +635,30 @@ def detect_doc_type_by_content(content: str) -> str:
     if not section_counts:
         return "skill"
 
-    # 计算每种 doc_type 的加权得分
+    # 阶梯式判断
+    has_procedure = section_counts.get("procedure", 0) > 0
+    has_preconditions = section_counts.get("preconditions", 0) > 0
+    has_halt = section_counts.get("halt_conditions", 0) > 0
+    has_design = section_counts.get("design", 0) > 0
+    has_decisions = section_counts.get("decisions", 0) > 0
+    has_overview = section_counts.get("overview", 0) > 0
+
+    # 阶梯1：有操作步骤+执行约束 → skill
+    if has_procedure and (has_preconditions or has_halt):
+        return "skill"
+
+    # 阶梯2：有操作步骤但无执行约束（教程类博客）→ blog
+    # （这类内容 procedure 权重低，适合 blog 提取规则）
+
+    # 阶梯3：有设计维度 + 无操作步骤 → design_system
+    if has_design and not has_procedure:
+        return "design_system"
+
+    # 阶梯4：有决策对比 + overview 为主 → forum_post
+    if has_decisions and has_overview and not has_procedure:
+        return "forum_post"
+
+    # 阶梯5：按权重计算（兜底）
     doc_type_scores: dict[str, float] = {}
     for doc_type, weights in _SECTION_TYPE_WEIGHTS.items():
         score = 0.0
@@ -640,7 +667,6 @@ def detect_doc_type_by_content(content: str) -> str:
             score += weight * count
         doc_type_scores[doc_type] = score
 
-    # 返回得分最高的 doc_type
     best = max(doc_type_scores, key=doc_type_scores.get)
     return best
 
