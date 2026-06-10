@@ -29,7 +29,7 @@ CONFIG_FILE = SKILLMIND_HOME / "config.yaml"
 # 提取缓存：同一 source_hash + prompt_version → 直接复用
 EXTRACT_CACHE_DIR = CACHE_DIR / "extract_cache"
 
-CURRENT_PROMPT_VERSION = "extract_v6"
+CURRENT_PROMPT_VERSION = "extract_v7"
 
 # ---------------------------------------------------------------------------
 # 确保目录存在
