@@ -21,7 +21,7 @@ import re
 
 _CODE_BLOCK_RE = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
 _PARA_BREAK_RE = re.compile(r"\n\n+")
-_HEADING_RE = re.compile(r"\n#{1,6}\s+.+\n")
+_HEADING_RE = re.compile(r"(?:^|\n)#{1,6}\s+.+(?:\n|$)")
 _LINE_BREAK_RE = re.compile(r"\n")
 
 
@@ -50,7 +50,7 @@ class Chunker:
         return len(text) // self.chars_per_token
 
     def chunk(self, text: str) -> list[dict]:
-        """切分文本，返回 [{"chunk_id": int, "content": str, "estimated_tokens": int, "has_code_block": bool}, ...]"""
+        """切分文本，返回 [{"chunk_id": int, "content": str, "estimated_tokens": int, "has_code_block": bool, "source_section": str}, ...]"""
         if not text or not text.strip():
             return []
 
@@ -60,21 +60,24 @@ class Chunker:
             text_with_placeholders, code_blocks = text, []
 
         boundaries = self._find_semantic_boundaries(text_with_placeholders)
-        raw_chunks = self._split_with_overlap(text_with_placeholders, boundaries)
+        raw_chunks, start_positions = self._split_with_overlap(text_with_placeholders, boundaries)
 
         if self.preserve_code_blocks:
             raw_chunks = self._reinsert_code_blocks(raw_chunks, code_blocks)
 
         result: list[dict] = []
-        for i, chunk_text in enumerate(raw_chunks):
+        for i, (chunk_text, start_pos) in enumerate(zip(raw_chunks, start_positions)):
             stripped = chunk_text.strip()
             if not stripped:
                 continue
+            # 找到 chunk 起始位置之前最近的标题行作为 source_section
+            source_section = self._find_nearest_heading(text, start_pos)
             result.append({
                 "chunk_id": i,
                 "content": stripped,
                 "estimated_tokens": self.estimate_tokens(stripped),
                 "has_code_block": "```" in stripped,
+                "source_section": source_section,
             })
 
         # chunk 列表为空时（极短输入），兜底返回原文为单 chunk
@@ -85,6 +88,7 @@ class Chunker:
                 "content": stripped,
                 "estimated_tokens": self.estimate_tokens(stripped),
                 "has_code_block": "```" in stripped,
+                "source_section": self._find_nearest_heading(text, 0),
             })
         return result
 
@@ -138,16 +142,17 @@ class Chunker:
         boundaries.append(len(text))
         return sorted(set(boundaries))
 
-    def _split_with_overlap(self, text: str, boundaries: list[int]) -> list[str]:
-        """在语义边界处切分，相邻 chunk 之间保留 overlap。"""
+    def _split_with_overlap(self, text: str, boundaries: list[int]) -> tuple[list[str], list[int]]:
+        """在语义边界处切分，相邻 chunk 之间保留 overlap。返回 (chunks, start_positions)。"""
         target_size_chars = self.chunk_size * self.chars_per_token
         overlap_chars = self.chunk_overlap * self.chars_per_token
         min_size_chars = self.min_chunk_size * self.chars_per_token
 
         if len(text) <= target_size_chars:
-            return [text] if text.strip() else []
+            return ([text] if text.strip() else [], [0])
 
         chunks: list[str] = []
+        start_positions: list[int] = []
         i = 0
         while i < len(boundaries) - 1:
             start_pos = boundaries[i]
@@ -171,6 +176,7 @@ class Chunker:
                 len(text) <= target_size_chars or len(chunk_text) >= min_size_chars
             ):
                 chunks.append(chunk_text)
+                start_positions.append(start_pos)
 
             if j < len(boundaries) - 1:
                 overlap_start = max(start_pos, end_pos - overlap_chars)
@@ -183,7 +189,27 @@ class Chunker:
             else:
                 break
 
-        return chunks
+        return chunks, start_positions
+
+    def _find_nearest_heading(self, text: str, start_pos: int) -> str:
+        """找到 start_pos 所在位置的标题（优先精确匹配），否则找最近的前置标题。"""
+        headings: list[tuple[int, str]] = []
+        for m in _HEADING_RE.finditer(text):
+            headings.append((m.start(), m.group(0).strip().lstrip("#").strip()))
+
+        if not headings:
+            return "unknown"
+
+        # 精确匹配：标题恰好在 chunk 起始处
+        for h_start, h_text in headings:
+            if h_start == start_pos:
+                return h_text
+
+        # 找 start_pos 之前最近的标题
+        for h_start, h_text in reversed(headings):
+            if h_start < start_pos:
+                return h_text
+        return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +220,7 @@ def join_chunks_for_prompt(
     chunks: list[dict],
     max_chars: int,
 ) -> tuple[str, bool]:
-    """将 chunker.chunk() 输出拼成单一字符串，每个 chunk 前加 <<CHUNK N>> 标记。
+    """将 chunker.chunk() 输出拼成单一字符串，每个 chunk 前加 <<CHUNK N — SOURCE_SECTION: xxx>> 标记。
 
     超过 max_chars 时截尾（按整 chunk 丢弃，不在 chunk 内部切），返回 (拼接文本, 是否截尾)。
     """
@@ -206,7 +232,8 @@ def join_chunks_for_prompt(
     truncated = False
 
     for ch in chunks:
-        marker = f"<<CHUNK {ch['chunk_id']}>>\n"
+        section = ch.get("source_section", "unknown")
+        marker = f"<<CHUNK {ch['chunk_id']} — SOURCE_SECTION: {section}>>\n"
         body = ch["content"]
         cost = len(marker) + len(body) + 2  # +2 给两个换行分隔
 

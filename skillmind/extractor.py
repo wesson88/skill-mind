@@ -148,6 +148,12 @@ _USER_PROMPT_TEMPLATE = """【任务】
 若文档包含多个相对独立的主题，可返回 JSON 数组（每项一张笔记）；
 否则返回单个 JSON 对象。
 
+【边界约束】（重要）
+每个 chunk 前有 <<CHUNK N — SOURCE_SECTION: xxx>> 标记。
+**每张卡片必须严格对应源文档中一个明确的 Section**（以 SOURCE_SECTION 标记为准）。
+不同卡片的内容不得跨 Section 混合——同一段原文不得出现在两张卡片中。
+如果两个主题都引用了相同的原文内容，只保留一张卡。
+
 【字段定义】
 {
   "meta": {
@@ -380,7 +386,7 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return inter / union if union else 0.0
 
 
-def _merge_units(all_units: list[dict], *, console=None) -> list[dict]:
+def _merge_units(all_units: list[dict], *, doc_type: str = "skill", console=None) -> list[dict]:
     """跨批次合并 units：
 
     1. 卡片级去重：meta.name 相同（标准化）→ 保留首次，但把后续卡片独有的
@@ -480,7 +486,42 @@ def _merge_units(all_units: list[dict], *, console=None) -> list[dict]:
                 deduped.append(kc)
         unit["key_concepts"] = deduped
 
-    return merged
+    # --- 第四步：近重复卡检测与删除（仅对 blog/design_system 生效）---
+    # skill 文档各 section 之间有天然重叠（如多个阶段都提到同一前置条件），
+    # 这些重叠是合法结构，不应删除。
+    if doc_type not in ("blog", "design_system"):
+        return merged
+
+    NEAR_DUP_THRESHOLD = 0.7
+    deduped: list[dict] = []
+    deduped_kc_sets: list[set[str]] = []
+
+    for unit in merged:
+        cur_set = _kc_title_set(unit)
+        if not cur_set:
+            deduped.append(unit)
+            deduped_kc_sets.append(set())
+            continue
+
+        # 检查是否与已保留卡近重复
+        absorbed = False
+        for i, prev_set in enumerate(deduped_kc_sets):
+            if _jaccard(cur_set, prev_set) >= NEAR_DUP_THRESHOLD and len(cur_set) <= len(prev_set):
+                absorbed = True
+                if console:
+                    a_name = deduped[i].get("meta", {}).get("name", "")
+                    b_name = unit.get("meta", {}).get("name", "")
+                    console.print(
+                        f"  [dim]近重复卡删除：'{b_name}' 被 '{a_name}' 吸收"
+                        f"（Jaccard {NEAR_DUP_THRESHOLD}，content overlap 70%+）[/dim]"
+                    )
+                break
+
+        if not absorbed:
+            deduped.append(unit)
+            deduped_kc_sets.append(cur_set)
+
+    return deduped
 
 
 def _llm_extract_chunked(
@@ -549,7 +590,7 @@ def _llm_extract_chunked(
         raise RuntimeError("所有批次均提取失败")
 
     # 跨批次去重合并：卡片级 + key_concepts 级 + Jaccard 内容重叠合并
-    merged = _merge_units(all_units, console=console)
+    merged = _merge_units(all_units, doc_type=doc_type, console=console)
     if console and len(merged) < len(all_units):
         console.print(
             f"  [dim]合并去重：{len(all_units)} 张 → {len(merged)} 张"
