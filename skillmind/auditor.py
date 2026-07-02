@@ -114,6 +114,11 @@ class AuditReport:
     missing_count: int = 0
     section_coverage: list[SectionCoverage] = field(default_factory=list)
     audit_time: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
+    # v3: 调整口径 — "所有观点都覆盖" = complete_count / total(strict,忽略 weak)
+    # 95% approved 表示 95% 的原文 atomic 观点被草稿完整保留(非 weak / 非 missing)
+    complete_rate: float = 0.0
+    verdict: str = "unknown"                              # approved | review | rejected
+    verdict_thresholds: dict = field(default_factory=lambda: {"approved": 0.95, "review": 0.85})
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +200,16 @@ def audit_source(
     total_count = len(matches) or 1
     coverage_unweighted = (complete + 0.5 * weak) / total_count
     coverage_weighted = earned_weight / total_weight if total_weight > 0 else coverage_unweighted
+    # v3: complete_rate(严格,忽略 weak)— 95% 阈值要求所有观点都覆盖
+    complete_rate = complete / total_count
+
+    # v3: verdict 三档 — approved(≥ 0.95 complete 且 0 幻觉)/ review(≥ 0.85)/ rejected
+    if complete_rate >= 0.95 and len(halls) == 0:
+        verdict = "approved"
+    elif complete_rate >= 0.85:
+        verdict = "review"
+    else:
+        verdict = "rejected"
 
     # 7. 章节级覆盖率
     section_cov = _compute_section_coverage(points, matches)
@@ -214,6 +229,8 @@ def audit_source(
         weak_count=weak,
         missing_count=missing,
         section_coverage=section_cov,
+        complete_rate=complete_rate,
+        verdict=verdict,
     )
 
 
@@ -611,7 +628,17 @@ def render_audit_report(report: AuditReport) -> str:
     lines.append(f"| ❌ 缺失 | {report.missing_count} |")
     lines.append(f"| **加权覆盖率** | **{report.coverage_rate * 100:.1f}%** |")
     lines.append(f"| 简单覆盖率 | {report.coverage_rate_unweighted * 100:.1f}% |")
+    lines.append(f"| **完整保留率** | **{report.complete_rate * 100:.1f}%** |")
     lines.append(f"| 疑似幻觉条目 | {len(report.hallucinations)} |")
+    lines.append("")
+
+    # verdict 三档
+    _verdict_label = {
+        "approved": "✅ APPROVED（≥95% 完整保留 + 0 幻觉）",
+        "review":   "🟡 REVIEW（≥85% 完整保留，需人工复查弱化/幻觉项）",
+        "rejected": "❌ REJECTED（<85% 完整保留，建议改 prompt 重新提取）",
+    }
+    lines.append(f"**审计结论：{_verdict_label.get(report.verdict, report.verdict)}**")
     lines.append("")
 
     grade = _grade_from_coverage(report.coverage_rate, len(report.hallucinations))

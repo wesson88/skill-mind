@@ -827,7 +827,17 @@ def audit(
         # 终端打印摘要
         rate_pct = report.coverage_rate * 100
         rate_uw = report.coverage_rate_unweighted * 100
-        rate_color = "green" if rate_pct >= 85 else ("yellow" if rate_pct >= 70 else "red")
+        cr_pct = report.complete_rate * 100
+        rate_color = "green" if cr_pct >= 95 else ("yellow" if cr_pct >= 85 else "red")
+
+        # verdict 标签
+        _verdict_style = {
+            "approved": "[bold green]✅ APPROVED[/bold green]",
+            "review":   "[bold yellow]🟡 REVIEW[/bold yellow]",
+            "rejected": "[bold red]❌ REJECTED[/bold red]",
+        }
+        verdict_label = _verdict_style.get(report.verdict, report.verdict)
+
         summary = (
             f"原文: {report.source_title[:50]}\n"
             f"提取笔记: {len(report.extract_files)} 篇  原文: {report.original_chars:,} 字符\n\n"
@@ -835,9 +845,10 @@ def audit(
             f"  ✅ 完整: [green]{report.complete_count}[/green]\n"
             f"  🟡 弱化: [yellow]{report.weak_count}[/yellow]\n"
             f"  ❌ 缺失: [red]{report.missing_count}[/red]\n"
-            f"  加权覆盖率: [{rate_color}]{rate_pct:.1f}%[/{rate_color}]"
-            f"  (简单: {rate_uw:.1f}%)\n"
-            f"  🚨 疑似幻觉: [{'red' if report.hallucinations else 'dim'}]{len(report.hallucinations)}[/]\n"
+            f"  完整保留率: [{rate_color}]{cr_pct:.1f}%[/{rate_color}]"
+            f"  加权: {rate_pct:.1f}%  简单: {rate_uw:.1f}%\n"
+            f"  🚨 疑似幻觉: [{'red' if report.hallucinations else 'dim'}]{len(report.hallucinations)}[/]\n\n"
+            f"  审计结论: {verdict_label}"
         )
         console.print(Panel(summary, title="[bold]覆盖率审计 — 摘要[/bold]", border_style=rate_color))
 
