@@ -608,7 +608,7 @@ def _llm_extract(
 ) -> list[dict]:
     """调用 LLM 并解析 JSON。失败按 max_retries 指数退避重试。"""
     try:
-        creds = resolve_llm_credentials(cfg)
+        creds = resolve_llm_credentials(cfg, command="extract")
     except RuntimeError as e:
         # 凭证类错误明确包装，让上层不要降级
         raise _CredentialError(str(e))

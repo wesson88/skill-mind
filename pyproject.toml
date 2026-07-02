@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skillmind"
-version = "2.2.0"
+version = "2.3.0"
 description = "全源知识提炼系统 - 将 Skill/博客/论坛经验提炼为 Obsidian 知识库"
 readme = "README.md"
 requires-python = ">=3.11"

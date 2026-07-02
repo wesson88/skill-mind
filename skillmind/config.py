@@ -60,6 +60,15 @@ _DEFAULT_CONFIG: dict = {
         "api_base": "",      # 自定义 API 地址（可选）
         "qpm": 10,
     },
+    # 按指令独立配置 LLM（可选），未设置则回退到全局 llm 配置
+    # 支持的键：model / api_key / api_key_env / api_base / auth_mode / qpm / timeout / max_retries
+    # 示例：
+    #   llm_profiles:
+    #     extract:
+    #       model: anthropic/claude-sonnet-4-20250514
+    #     audit:
+    #       model: openai/gpt-4o
+    "llm_profiles": {},
     # 多 provider Key 存储区，格式: { "anthropic": "sk-ant-xxx", "openai": "sk-xxx", ... }
     "api_keys": {},
     "vault_dir": str(VAULT_DIR),
@@ -67,6 +76,12 @@ _DEFAULT_CONFIG: dict = {
     # 输出文件命名：output_prefix 文件名前缀，如 "SM_" 或 "技能_"，空字符串表示不加前缀
     "output_prefix": "",
 }
+
+# llm_profiles 中允许覆盖的键名
+_LLM_PROFILE_KEYS = (
+    "model", "api_key", "api_key_env", "api_base",
+    "auth_mode", "qpm", "timeout", "max_retries",
+)
 
 # provider 前缀 → 对应的默认环境变量名
 _PROVIDER_ENV_MAP: dict[str, str] = {
@@ -122,9 +137,17 @@ def get_vault_dir(cfg: dict | None = None) -> Path:
 # LLM 认证解析
 # ---------------------------------------------------------------------------
 
-def resolve_llm_credentials(cfg: dict | None = None) -> dict:
+def resolve_llm_credentials(cfg: dict | None = None, *, command: str = "") -> dict:
     """
     解析 LLM 认证信息，返回可直接传给 litellm 的参数字典。
+
+    Parameters
+    ----------
+    cfg : dict | None
+        全局配置（load_config()）。
+    command : str
+        调用指令名称（如 'extract' / 'audit'），用于查找 llm_profiles 中的独立配置。
+        为空字符串时只使用全局 llm 配置。
 
     Key 查找优先级（api_key 模式）：
       1. llm.api_key（配置文件直接写入）
@@ -134,7 +157,18 @@ def resolve_llm_credentials(cfg: dict | None = None) -> dict:
       5. 依次尝试所有已知 provider 的环境变量
     """
     cfg = cfg or load_config()
-    llm_cfg = cfg.get("llm", {})
+
+    # 合并 llm_profiles：command 级配置覆盖全局 llm 配置
+    llm_cfg = dict(cfg.get("llm", {}))
+    if command:
+        profiles = cfg.get("llm_profiles", {})
+        profile = profiles.get(command, {})
+        if isinstance(profile, dict):
+            for k in _LLM_PROFILE_KEYS:
+                v = profile.get(k)
+                if v is not None and v != "":
+                    llm_cfg[k] = v
+
     auth_mode = llm_cfg.get("auth_mode", "api_key")
     model = llm_cfg.get("model", "anthropic/claude-3-5-haiku-20241022")
 

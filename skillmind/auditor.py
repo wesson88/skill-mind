@@ -1,11 +1,13 @@
-"""提取覆盖率审计（Auditor）
+"""提取覆盖率审计（Auditor）v2
 
 对一份已 publish 到 Vault 的提取笔记做"原文 vs 提取"的客观对照：
 
-1. Pass 1 — LLM 从原文抽 atomic 观点清单（rule / enum / number / example 四类）
-2. Pass 2 — LLM 对每条观点逐条核对提取笔记：✅ 完整 / 🟡 弱化 / ❌ 缺失
+1. Pass 1 — LLM 从原文抽 atomic 观点清单（rule / enum / number / example / concept / procedure_step 六类）
+2. Pass 2 — LLM 对每条观点逐条核对提取笔记：✅ 完整 / 🟡 弱化 / ❌ 缺失（大列表自动分批）
 3. 本地规则 — 扫提取笔记里的精确数字 / wikilink 反查原文是否真存在（幻觉检测）
-4. 渲染 markdown 报告：覆盖率百分比 + 缺失清单 + 弱化清单 + 幻觉清单
+4. 加权覆盖率 — rule/number 权重高于 example，更真实反映信息保真度
+5. 章节级覆盖 — 按原文章节分段统计，暴露整段遗漏
+6. 渲染 markdown 报告：覆盖率百分比 + 章节热力图 + 缺失清单 + 弱化清单 + 幻觉清单
 
 设计目标：作为 prompt_version 升级的质量回归基线，让"提取改了一版，质量是好是坏"
 有客观数据可依。
@@ -33,6 +35,26 @@ from skillmind.config import (
 
 
 # ---------------------------------------------------------------------------
+# 加权配置
+# ---------------------------------------------------------------------------
+
+# 各 kind 在覆盖率计算中的权重：规则和数值最重要，示例性描述最轻
+_KIND_WEIGHT: dict[str, float] = {
+    "rule":           1.0,
+    "number":         1.0,
+    "procedure_step": 0.8,
+    "concept":        0.8,
+    "enum":           0.6,
+    "example":        0.3,
+}
+
+_VALID_KINDS = set(_KIND_WEIGHT.keys())
+
+# Pass 2 每批发给 LLM 的最大 point 条数（避免超长 prompt 导致遗漏）
+_COMPARE_BATCH_SIZE = 60
+
+
+# ---------------------------------------------------------------------------
 # 数据结构
 # ---------------------------------------------------------------------------
 
@@ -41,7 +63,8 @@ class AtomicPoint:
     """从原文抽取的一条 atomic 观点。"""
     id: int
     statement: str           # 观点本身，一句话
-    kind: str                # rule | enum | number | example
+    kind: str                # rule | enum | number | example | concept | procedure_step
+    section: str = ""        # 观点所在原文章节标题（用于章节级统计）
     source_quote: str = ""   # 原文最贴近的引用（≤ 80 字）
 
 
@@ -64,6 +87,17 @@ class Hallucination:
 
 
 @dataclass
+class SectionCoverage:
+    """章节级覆盖率统计。"""
+    section: str
+    total: int
+    complete: int
+    weak: int
+    missing: int
+    coverage_rate: float     # 加权覆盖率
+
+
+@dataclass
 class AuditReport:
     source_hash: str
     source_title: str
@@ -73,10 +107,12 @@ class AuditReport:
     points: list[AtomicPoint]
     matches: list[PointMatch]
     hallucinations: list[Hallucination]
-    coverage_rate: float                          # (✅ + 0.5×🟡) / total
+    coverage_rate: float                          # 加权 (✅×w + 0.5×🟡×w) / Σw
+    coverage_rate_unweighted: float               # 简单 (✅ + 0.5×🟡) / total
     complete_count: int = 0
     weak_count: int = 0
     missing_count: int = 0
+    section_coverage: list[SectionCoverage] = field(default_factory=list)
     audit_time: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
 
 
@@ -92,23 +128,7 @@ def audit_source(
     max_extract_files: int = 10,
     vault_skills_override: str | Path | None = None,
 ) -> AuditReport:
-    """对一个 source_hash 对应的原文 + 提取笔记做覆盖率审计。
-
-    Parameters
-    ----------
-    source_hash : str
-        原文 SHA256（hashes.yaml 的 key）。支持前缀匹配。
-    cfg : dict | None
-        skillmind 配置；缺省 load_config()。
-    console : rich.console.Console | None
-        进度输出。
-    max_extract_files : int
-        最多审计的提取笔记数量（一文多卡时；默认 10）。
-
-    Returns
-    -------
-    AuditReport
-    """
+    """对一个 source_hash 对应的原文 + 提取笔记做覆盖率审计。"""
     cfg = cfg or load_config()
 
     # 1. 解析 source_hash → 原文 + metadata
@@ -117,7 +137,7 @@ def audit_source(
     if not raw_text.strip():
         raise RuntimeError(f"原文为空或读取失败：{source_info.get('raw_path', '')}")
 
-    # 2. 扫 vault 找对应提取笔记（按 frontmatter source_hash 匹配）
+    # 2. 扫 vault 找对应提取笔记
     extract_files = _find_extract_notes(
         full_hash, cfg, max_n=max_extract_files,
         vault_skills_override=vault_skills_override,
@@ -138,32 +158,46 @@ def audit_source(
         console.print("  [cyan]Pass 1 — 抽取原文 atomic 观点清单...[/cyan]")
     points = _extract_atomic_points(raw_text, source_info, cfg)
     if console:
-        kinds = {"rule": 0, "enum": 0, "number": 0, "example": 0}
+        kinds: dict[str, int] = {}
         for p in points:
             kinds[p.kind] = kinds.get(p.kind, 0) + 1
-        console.print(
-            f"  [dim]  抽出 {len(points)} 条观点："
-            f"rule={kinds['rule']} / enum={kinds['enum']} / "
-            f"number={kinds['number']} / example={kinds['example']}[/dim]"
-        )
+        kind_str = " / ".join(f"{k}={v}" for k, v in sorted(kinds.items()))
+        console.print(f"  [dim]  抽出 {len(points)} 条观点：{kind_str}[/dim]")
 
-    # 4. Pass 2 — LLM 逐条核对提取笔记
+    # 4. Pass 2 — LLM 逐条核对提取笔记（自动分批）
     extract_text = _concat_extracts(extract_files)
     if console:
         console.print(f"  [cyan]Pass 2 — 对照 {len(points)} 条观点 vs 提取笔记...[/cyan]")
-    matches = _compare_with_extracts(points, extract_text, cfg)
+    matches = _compare_with_extracts_batched(points, extract_text, cfg, console=console)
 
     # 5. 本地幻觉检测（数字 + wikilink）
     if console:
         console.print("  [cyan]本地规则 — 幻觉检测（数字 / wikilink）...[/cyan]")
     halls = _detect_hallucinations(extract_files, raw_text)
 
-    # 6. 统计
+    # 6. 统计（加权 + 非加权）
     complete = sum(1 for m in matches if m.status == "complete")
     weak = sum(1 for m in matches if m.status == "weak")
     missing = sum(1 for m in matches if m.status == "missing")
-    total = len(matches) or 1
-    coverage = (complete + 0.5 * weak) / total
+
+    by_id = {p.id: p for p in points}
+    total_weight = 0.0
+    earned_weight = 0.0
+    for m in matches:
+        p = by_id.get(m.point_id)
+        w = _KIND_WEIGHT.get(p.kind, 0.5) if p else 0.5
+        total_weight += w
+        if m.status == "complete":
+            earned_weight += w
+        elif m.status == "weak":
+            earned_weight += w * 0.5
+
+    total_count = len(matches) or 1
+    coverage_unweighted = (complete + 0.5 * weak) / total_count
+    coverage_weighted = earned_weight / total_weight if total_weight > 0 else coverage_unweighted
+
+    # 7. 章节级覆盖率
+    section_cov = _compute_section_coverage(points, matches)
 
     return AuditReport(
         source_hash=full_hash,
@@ -174,11 +208,60 @@ def audit_source(
         points=points,
         matches=matches,
         hallucinations=halls,
-        coverage_rate=coverage,
+        coverage_rate=coverage_weighted,
+        coverage_rate_unweighted=coverage_unweighted,
         complete_count=complete,
         weak_count=weak,
         missing_count=missing,
+        section_coverage=section_cov,
     )
+
+
+def _compute_section_coverage(
+    points: list[AtomicPoint],
+    matches: list[PointMatch],
+) -> list[SectionCoverage]:
+    """按 section 字段分组统计覆盖率。"""
+    by_id = {p.id: p for p in points}
+    match_by_id = {m.point_id: m for m in matches}
+
+    sections: dict[str, dict[str, int]] = {}
+    for p in points:
+        sec = p.section or "(未标注章节)"
+        bucket = sections.setdefault(sec, {"total": 0, "complete": 0, "weak": 0, "missing": 0})
+        bucket["total"] += 1
+        m = match_by_id.get(p.id)
+        status = m.status if m else "missing"
+        bucket[status] = bucket.get(status, 0) + 1
+
+    result: list[SectionCoverage] = []
+    for sec, s in sections.items():
+        t = s["total"] or 1
+        # 章节内加权
+        w_total = 0.0
+        w_earned = 0.0
+        for p in points:
+            if (p.section or "(未标注章节)") != sec:
+                continue
+            w = _KIND_WEIGHT.get(p.kind, 0.5)
+            w_total += w
+            m = match_by_id.get(p.id)
+            if m and m.status == "complete":
+                w_earned += w
+            elif m and m.status == "weak":
+                w_earned += w * 0.5
+        rate = w_earned / w_total if w_total > 0 else 0.0
+        result.append(SectionCoverage(
+            section=sec,
+            total=s["total"],
+            complete=s["complete"],
+            weak=s["weak"],
+            missing=s["missing"],
+            coverage_rate=rate,
+        ))
+    # 按覆盖率升序排列（最差的在前，方便定位问题）
+    result.sort(key=lambda x: x.coverage_rate)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -192,24 +275,32 @@ _AUDIT_SYSTEM_PROMPT = (
 )
 
 _POINTS_PROMPT_TEMPLATE = """【任务】
-从以下原文中按 atomic 粒度（一句话能表达完整意思）抽取每一条规则 / 枚举项 / 数值阈值 / 示例性论断。
+从以下原文中按 atomic 粒度（一句话能表达完整意思）抽取每一条独立观点。
 
 【粒度要求】
 - atomic = 拆到不能再拆。"hero 字号 60-72px"是一条；"hero 字号 60-72px + 间距 64px"必须拆成两条。
 - 必须覆盖所有 must / never / ban / prefer / avoid / required 等结构性硬规则。
 - 必须覆盖所有具体数值（1-10 评分、像素值、字号、Choose exactly N 等）。
 - 必须覆盖原文中的列表项（即使有 10-30 条，全部列出）。
+- 必须覆盖原文中的操作步骤（每个步骤一条，kind=procedure_step）。
+- 必须覆盖原文中的核心概念/定义（kind=concept）。
 - 示例性表述（"like X"、"such as Y"）也抽出，但 kind 标 example。
 
 【kind 分类】
-- rule    : 硬性约束（must/never/ban）或软建议（prefer/avoid）
-- enum    : 列表项（成员之一）— 如"允许的字体名：Inter / Satoshi / Geist"中的每个名字
-- number  : 含具体数值的观点（含百分比、比例、像素、字号、计数）
-- example : 示例性表述、举例说明，删了不影响规则本身
+- rule           : 硬性约束（must/never/ban）或软建议（prefer/avoid）
+- enum           : 列表项（成员之一）— 如"允许的字体名：Inter / Satoshi / Geist"中的每个名字
+- number         : 含具体数值的观点（含百分比、比例、像素、字号、计数）
+- concept        : 定义、解释、原理性描述（"X 是什么"、"X 的作用是"）
+- procedure_step : 操作步骤、执行流程中的单步动作
+- example        : 示例性表述、举例说明，删了不影响规则本身
+
+【section 字段】
+- 每条观点必须标注其来源的原文章节标题（取最近的 ## 或 # 标题）
+- 若原文无明显标题，用"(全文)"或自拟 ≤ 10 字概括
 
 【输出 JSON 数组】
 [
-  {"id": 1, "statement": "一句话观点", "kind": "rule|enum|number|example", "source_quote": "原文最贴近的引用（≤ 80 字）"},
+  {"id": 1, "statement": "一句话观点", "kind": "rule|enum|number|concept|procedure_step|example", "section": "原文章节标题", "source_quote": "原文最贴近的引用（≤ 80 字）"},
   ...
 ]
 
@@ -227,10 +318,9 @@ _POINTS_PROMPT_TEMPLATE = """【任务】
 
 def _extract_atomic_points(text: str, source_info: dict, cfg: dict) -> list[AtomicPoint]:
     """LLM Pass 1：从原文抽 atomic 观点清单。"""
-    creds = resolve_llm_credentials(cfg)
+    creds = resolve_llm_credentials(cfg, command="audit")
 
-    # 长文截断保护：审计 prompt 单次最多吃 60K 字符（≈20K tokens）
-    # 超长文档（>60K 字符）按段截断；多数 SKILL.md 都在 30K 以内
+    # 长文截断保护
     if len(text) > 60000:
         text = text[:60000] + "\n\n[... 原文过长，已截至 60K 字符。审计基于本段。]"
 
@@ -251,19 +341,21 @@ def _extract_atomic_points(text: str, source_info: dict, cfg: dict) -> list[Atom
         if not statement:
             continue
         kind = str(item.get("kind", "rule")).strip().lower()
-        if kind not in ("rule", "enum", "number", "example"):
+        if kind not in _VALID_KINDS:
             kind = "rule"
+        section = str(item.get("section", "")).strip()[:80]
         points.append(AtomicPoint(
             id=int(item.get("id", i + 1)) or (i + 1),
             statement=statement,
             kind=kind,
+            section=section,
             source_quote=str(item.get("source_quote", "")).strip()[:200],
         ))
     return points
 
 
 # ---------------------------------------------------------------------------
-# Pass 2：逐条核对
+# Pass 2：逐条核对（支持自动分批）
 # ---------------------------------------------------------------------------
 
 _COMPARE_PROMPT_TEMPLATE = """【任务】
@@ -274,6 +366,14 @@ _COMPARE_PROMPT_TEMPLATE = """【任务】
 - weak     : 出现了但简化 / 改写损失了精度（如数值丢失、长清单只保留示例、对称项弱势侧被砍）
 - missing  : 提取笔记中完全找不到该观点
 
+【判定注意事项】
+- 提取笔记可能是中文翻译的，语义匹配即可，不要因为语言/措辞不同就判 missing
+- 提取笔记可能把原文的一段拆成多处引用，只要关键信息在就算 complete
+- 对 number 类观点：提取笔记中必须保留原始数值才算 complete；改为定性描述（如"适当间距"替代"64px"）算 weak
+- 对 enum 类观点：清单中单个成员缺失算 weak（注明哪个缺失）；超过一半缺失算 missing
+- 对 rule 类观点：核心约束语义保留即可；但如果"禁止"变成了"建议"，精度下降算 weak
+- evidence 必须是提取笔记里 verbatim 的片段
+
 【输出 JSON 数组】
 对每条观点输出一项，按 point_id 顺序：
 [
@@ -283,8 +383,6 @@ _COMPARE_PROMPT_TEMPLATE = """【任务】
 
 【硬性要求】
 - 必须为每条观点都输出一项，不要遗漏
-- 提取笔记可能是中文翻译的，语义匹配即可，不要因为措辞不同就判 missing
-- evidence 必须是提取笔记里 verbatim 的片段
 
 【原文观点清单】
 {points_json}
@@ -295,27 +393,56 @@ _COMPARE_PROMPT_TEMPLATE = """【任务】
 请直接输出 JSON 数组。"""
 
 
+def _compare_with_extracts_batched(
+    points: list[AtomicPoint],
+    extract_text: str,
+    cfg: dict,
+    *,
+    console=None,
+) -> list[PointMatch]:
+    """LLM Pass 2：逐条核对，大列表自动分批避免遗漏。"""
+    if len(points) <= _COMPARE_BATCH_SIZE:
+        return _compare_with_extracts(points, extract_text, cfg)
+
+    # 分批
+    all_matches: list[PointMatch] = []
+    total_batches = (len(points) + _COMPARE_BATCH_SIZE - 1) // _COMPARE_BATCH_SIZE
+    for batch_idx in range(total_batches):
+        start = batch_idx * _COMPARE_BATCH_SIZE
+        end = min(start + _COMPARE_BATCH_SIZE, len(points))
+        batch_points = points[start:end]
+        if console:
+            console.print(
+                f"  [dim]  核对批次 {batch_idx+1}/{total_batches}：观点 {start+1}-{end}[/dim]"
+            )
+        batch_matches = _compare_with_extracts(batch_points, extract_text, cfg)
+        all_matches.extend(batch_matches)
+
+    return all_matches
+
+
 def _compare_with_extracts(
     points: list[AtomicPoint],
     extract_text: str,
     cfg: dict,
 ) -> list[PointMatch]:
-    """LLM Pass 2：逐条核对原文观点是否在提取笔记中保留。"""
-    creds = resolve_llm_credentials(cfg)
+    """LLM Pass 2（单批）：逐条核对原文观点是否在提取笔记中保留。"""
+    creds = resolve_llm_credentials(cfg, command="audit")
 
     points_payload = [
         {"point_id": p.id, "statement": p.statement, "kind": p.kind}
         for p in points
     ]
 
-    # 提取文本同样做截断保护
-    if len(extract_text) > 60000:
-        extract_text = extract_text[:60000] + "\n\n[... 提取笔记过长，已截至 60K 字符。]"
+    # 提取文本截断保护
+    et = extract_text
+    if len(et) > 60000:
+        et = et[:60000] + "\n\n[... 提取笔记过长，已截至 60K 字符。]"
 
     user_prompt = (
         _COMPARE_PROMPT_TEMPLATE
         .replace("{points_json}", json.dumps(points_payload, ensure_ascii=False))
-        .replace("{extract_text}", extract_text)
+        .replace("{extract_text}", et)
     )
 
     response = _call_llm(creds, _AUDIT_SYSTEM_PROMPT, user_prompt, cfg)
@@ -362,10 +489,22 @@ _NUMBER_RE = re.compile(
 
 _WIKILINK_RE = re.compile(r'\[\[([^\]|#]+?)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]')
 
+# frontmatter 区域跳过检测的字段（这些字段由工具生成，不算幻觉）
+_FRONTMATTER_SKIP_KEYS = {"source_hash", "uuid", "card_index", "card_total", "prompt_version"}
+
 
 def _normalize_for_hall_match(s: str) -> str:
     """归一化用于幻觉反查：小写 + 去空白。"""
     return re.sub(r'\s+', '', s.lower())
+
+
+def _strip_frontmatter(text: str) -> str:
+    """去掉 YAML frontmatter，只返回正文部分。"""
+    if text.startswith("---"):
+        end = text.find("\n---", 4)
+        if end >= 0:
+            return text[end + 4:].lstrip()
+    return text
 
 
 def _detect_hallucinations(extract_files: list[Path], raw_text: str) -> list[Hallucination]:
@@ -375,9 +514,12 @@ def _detect_hallucinations(extract_files: list[Path], raw_text: str) -> list[Hal
 
     for fp in extract_files:
         try:
-            note_text = fp.read_text(encoding="utf-8")
+            full_text = fp.read_text(encoding="utf-8")
         except Exception:
             continue
+
+        # 只对正文部分做幻觉检测（frontmatter 中的 hash/uuid 等不算）
+        note_text = _strip_frontmatter(full_text)
 
         # 1. 数字检测
         for m in _NUMBER_RE.finditer(note_text):
@@ -385,9 +527,12 @@ def _detect_hallucinations(extract_files: list[Path], raw_text: str) -> list[Hal
             value_norm = _normalize_for_hall_match(value)
             if value_norm in raw_norm:
                 continue
-            # 二次检查：数字本身（去单位）是否在原文出现 → 可能是单位差异
+            # 二次检查：数字本身（去单位）是否在原文出现
             num_only = re.search(r'\d+(?:\.\d+)?', value)
             if num_only and num_only.group(0) in raw_text:
+                continue
+            # 跳过非常小的数字（1-9 单独出现太常见，误报率高）
+            if num_only and len(num_only.group(0)) <= 1:
                 continue
             # 给出局部上下文
             ctx_start = max(0, m.start() - 30)
@@ -409,26 +554,19 @@ def _detect_hallucinations(extract_files: list[Path], raw_text: str) -> list[Hal
             # 跳过路径中带 / 的（明确指向 vault 路径，不算幻觉）
             if "/" in target:
                 continue
-            # 反查原文（语义匹配 + 字面匹配双重）
+            # 反查原文
             if target_norm in raw_norm:
                 continue
-            # 跳过常见 vault 通用链接（避免误报）
-            common_skips = ("anti-generic", "color discipline", "design system",
-                           "key-concepts", "core-rules", "未命名笔记")
-            if any(skip in target.lower() for skip in common_skips):
-                halls.append(Hallucination(
-                    kind="wikilink",
-                    value=f"[[{target}]]",
-                    found_in_extract=fp.name,
-                    note="疑似为美化编造的关联链接（原文无对应概念）",
-                ))
-            else:
-                halls.append(Hallucination(
-                    kind="wikilink",
-                    value=f"[[{target}]]",
-                    found_in_extract=fp.name,
-                    note="原文未提及该关联词",
-                ))
+            # 模糊匹配：target 中的每个单词都在原文出现（可能是拼接概念名）
+            words = [w for w in re.split(r'[\s\-_]+', target.lower()) if len(w) > 2]
+            if words and all(w in raw_text.lower() for w in words):
+                continue
+            halls.append(Hallucination(
+                kind="wikilink",
+                value=f"[[{target}]]",
+                found_in_extract=fp.name,
+                note="原文未提及该关联词",
+            ))
 
     # 去重（同一文件同一 value 只报一次）
     seen: set[tuple[str, str, str]] = set()
@@ -463,7 +601,6 @@ def render_audit_report(report: AuditReport) -> str:
     lines.append("")
 
     # 总览
-    total = len(report.matches) or 1
     lines.append("## 📊 总览")
     lines.append("")
     lines.append(f"| 指标 | 数值 |")
@@ -472,7 +609,8 @@ def render_audit_report(report: AuditReport) -> str:
     lines.append(f"| ✅ 完整保留 | {report.complete_count} |")
     lines.append(f"| 🟡 弱化 | {report.weak_count} |")
     lines.append(f"| ❌ 缺失 | {report.missing_count} |")
-    lines.append(f"| **覆盖率** | **{report.coverage_rate * 100:.1f}%** |")
+    lines.append(f"| **加权覆盖率** | **{report.coverage_rate * 100:.1f}%** |")
+    lines.append(f"| 简单覆盖率 | {report.coverage_rate_unweighted * 100:.1f}% |")
     lines.append(f"| 疑似幻觉条目 | {len(report.hallucinations)} |")
     lines.append("")
 
@@ -480,19 +618,46 @@ def render_audit_report(report: AuditReport) -> str:
     lines.append(f"**保真度评级：{grade}**")
     lines.append("")
 
+    lines.append(f"> 加权规则：rule/number × 1.0, concept/procedure_step × 0.8, enum × 0.6, example × 0.3")
+    lines.append("")
+
     # 按 kind 分类的覆盖率
     by_kind = _coverage_by_kind(report)
     if by_kind:
         lines.append("### 按观点类型分类")
         lines.append("")
-        lines.append("| 类型 | 总数 | ✅ | 🟡 | ❌ | 覆盖率 |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| 类型 | 权重 | 总数 | ✅ | 🟡 | ❌ | 覆盖率 |")
+        lines.append("|---|---|---|---|---|---|---|")
         for kind, stats in by_kind.items():
             t = stats["total"]
+            w = _KIND_WEIGHT.get(kind, 0.5)
             rate = (stats["complete"] + 0.5 * stats["weak"]) / t * 100 if t else 0
             lines.append(
-                f"| {kind} | {t} | {stats['complete']} | "
+                f"| {kind} | {w} | {t} | {stats['complete']} | "
                 f"{stats['weak']} | {stats['missing']} | {rate:.1f}% |"
+            )
+        lines.append("")
+
+    # 章节级覆盖率热力图
+    if report.section_coverage:
+        lines.append("### 📋 章节级覆盖率")
+        lines.append("")
+        lines.append("| 章节 | 观点数 | ✅ | 🟡 | ❌ | 覆盖率 | 状态 |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for sc in report.section_coverage:
+            pct = sc.coverage_rate * 100
+            if pct >= 90:
+                bar = "🟢"
+            elif pct >= 70:
+                bar = "🟡"
+            elif pct >= 50:
+                bar = "🟠"
+            else:
+                bar = "🔴"
+            sec_name = sc.section[:40]
+            lines.append(
+                f"| {sec_name} | {sc.total} | {sc.complete} | "
+                f"{sc.weak} | {sc.missing} | {pct:.0f}% | {bar} |"
             )
         lines.append("")
 
@@ -501,12 +666,19 @@ def render_audit_report(report: AuditReport) -> str:
     if missing:
         lines.append(f"## ❌ 缺失观点（{len(missing)} 条）")
         lines.append("")
+        # 按 section 分组
+        by_sec: dict[str, list[tuple[AtomicPoint, PointMatch]]] = {}
         for p, m in missing:
-            lines.append(f"- **[{p.kind}]** {p.statement}")
-            if p.source_quote:
-                lines.append(f"  - 原文：> {p.source_quote}")
-            if m.notes:
-                lines.append(f"  - 备注：{m.notes}")
+            sec = p.section or "(未标注)"
+            by_sec.setdefault(sec, []).append((p, m))
+        for sec, items in by_sec.items():
+            lines.append(f"### {sec}")
+            for p, m in items:
+                lines.append(f"- **[{p.kind}]** {p.statement}")
+                if p.source_quote:
+                    lines.append(f"  - 原文：> {p.source_quote}")
+                if m.notes:
+                    lines.append(f"  - 备注：{m.notes}")
         lines.append("")
 
     # 弱化观点
@@ -531,7 +703,7 @@ def render_audit_report(report: AuditReport) -> str:
             lines.append(f"  - 位置：{h.found_in_extract}")
         lines.append("")
 
-    # 完整观点（仅在数量少时列出，避免报告爆炸）
+    # 完整观点
     complete = [(p, m) for p, m in zip(report.points, report.matches) if m.status == "complete"]
     if complete and len(complete) <= 50:
         lines.append(f"## ✅ 完整保留观点（{len(complete)} 条）")
@@ -547,7 +719,7 @@ def render_audit_report(report: AuditReport) -> str:
 
 
 def _grade_from_coverage(rate: float, hall_count: int) -> str:
-    """覆盖率 + 幻觉数 → 评级。"""
+    """加权覆盖率 + 幻觉数 → 评级。"""
     pct = rate * 100
     if pct >= 95 and hall_count == 0:
         return "A（极佳，可作权威复刻源）"
@@ -572,7 +744,7 @@ def _coverage_by_kind(report: AuditReport) -> dict[str, dict[str, int]]:
             continue
         bucket = by_kind.setdefault(p.kind, {"total": 0, "complete": 0, "weak": 0, "missing": 0})
         bucket["total"] += 1
-        bucket[m.status] += 1
+        bucket[m.status] = bucket.get(m.status, 0) + 1
     return by_kind
 
 
@@ -587,7 +759,6 @@ def _resolve_source(source_hash_prefix: str) -> tuple[str, dict]:
     hashes = _load_hashes()
     matched = [sha for sha in hashes if sha.startswith(source_hash_prefix)]
     if not matched:
-        # 兜底：试着按路径关键词匹配
         matched = [
             sha for sha, info in hashes.items()
             if source_hash_prefix in info.get("source_path", "")
@@ -612,7 +783,6 @@ def _read_raw_text(source_info: dict) -> str:
         raise RuntimeError("source_info 缺少 raw_path")
     p = Path(raw_path)
     if not p.exists():
-        # 兜底：按 hash 拼路径
         sha = source_info.get("source_hash", "")
         if sha:
             candidate = RAW_DIR / sha[:2] / f"{sha}.md"
@@ -630,10 +800,7 @@ def _find_extract_notes(
     max_n: int,
     vault_skills_override: str | Path | None = None,
 ) -> list[Path]:
-    """在 vault 下扫所有 .md 笔记，匹配 frontmatter 的 source_hash。
-
-    vault_skills_override 用于审计放在非默认 vault 路径下的笔记（如真正的 Obsidian vault）。
-    """
+    """在 vault 下扫所有 .md 笔记，匹配 frontmatter 的 source_hash。"""
     import yaml as _yaml
 
     if vault_skills_override:
@@ -650,7 +817,6 @@ def _find_extract_notes(
             text = fp.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        # 提取 frontmatter
         if not text.startswith("---"):
             continue
         end = text.find("\n---", 4)
@@ -679,7 +845,7 @@ def _concat_extracts(files: list[Path]) -> str:
             text = fp.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        # 去掉 frontmatter，保留正文（评审关心内容）
+        # 去掉 frontmatter
         if text.startswith("---"):
             end = text.find("\n---", 4)
             if end >= 0:
@@ -692,8 +858,18 @@ def _call_llm(creds: dict, system: str, user: str, cfg: dict) -> str:
     """统一的 LLM 调用入口。失败按 max_retries 重试。"""
     from litellm import completion  # type: ignore
 
-    timeout = int(cfg.get("llm", {}).get("timeout", 180))
-    max_retries = int(cfg.get("llm", {}).get("max_retries", 2))
+    # 取 audit profile 的 timeout/max_retries；未设置则回退全局
+    llm_cfg = dict(cfg.get("llm", {}))
+    profiles = cfg.get("llm_profiles", {})
+    audit_profile = profiles.get("audit", {})
+    if isinstance(audit_profile, dict):
+        for k in ("timeout", "max_retries"):
+            v = audit_profile.get(k)
+            if v is not None:
+                llm_cfg[k] = v
+
+    timeout = int(llm_cfg.get("timeout", 180))
+    max_retries = int(llm_cfg.get("max_retries", 2))
 
     kwargs: dict[str, Any] = {
         "model": creds["model"],
@@ -704,6 +880,7 @@ def _call_llm(creds: dict, system: str, user: str, cfg: dict) -> str:
         "temperature": 0,
         "timeout": timeout,
         "api_key": creds["api_key"],
+        "max_tokens": 16384,   # 审计 prompt 输出较长
     }
     if "api_base" in creds:
         kwargs["api_base"] = creds["api_base"]
@@ -728,11 +905,9 @@ def _parse_json_array(text: str) -> list[dict]:
     text = text.strip()
     if len(text) > 200000:
         text = text[:200000]
-    # 1. 代码块包裹
     m = _CODEBLOCK_RE.search(text)
     if m:
         text = m.group(1).strip()
-    # 2. 截最外层 [...]
     if not text.startswith("["):
         idx = text.find("[")
         if idx >= 0:
@@ -743,7 +918,6 @@ def _parse_json_array(text: str) -> list[dict]:
     if last >= 0:
         text = text[:last + 1]
 
-    # 3. 解析（含截断修复）
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -755,12 +929,11 @@ def _parse_json_array(text: str) -> list[dict]:
 
 
 def _fix_array_truncation(text: str) -> str:
-    """简化版的 JSON 数组截断修复：找最后一个完整 } 然后补 ]。"""
+    """简化版的 JSON 数组截断修复。"""
     last_brace = text.rfind("}")
     if last_brace < 0:
         return text
     truncated = text[:last_brace + 1]
-    # 数 [ 和 ] 的不平衡
     depth = 0
     in_string = False
     escape = False

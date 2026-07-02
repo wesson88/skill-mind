@@ -798,9 +798,9 @@ def audit(
         out_path.write_text(md, encoding="utf-8")
         console.print(f"[green]✓ 报告已写入:[/green] {out_path}")
     else:
-        # 终端打印摘要 + 标记位置
-        total = max(len(report.matches), 1)
+        # 终端打印摘要
         rate_pct = report.coverage_rate * 100
+        rate_uw = report.coverage_rate_unweighted * 100
         rate_color = "green" if rate_pct >= 85 else ("yellow" if rate_pct >= 70 else "red")
         summary = (
             f"原文: {report.source_title[:50]}\n"
@@ -809,10 +809,24 @@ def audit(
             f"  ✅ 完整: [green]{report.complete_count}[/green]\n"
             f"  🟡 弱化: [yellow]{report.weak_count}[/yellow]\n"
             f"  ❌ 缺失: [red]{report.missing_count}[/red]\n"
-            f"  覆盖率: [{rate_color}]{rate_pct:.1f}%[/{rate_color}]\n"
+            f"  加权覆盖率: [{rate_color}]{rate_pct:.1f}%[/{rate_color}]"
+            f"  (简单: {rate_uw:.1f}%)\n"
             f"  🚨 疑似幻觉: [{'red' if report.hallucinations else 'dim'}]{len(report.hallucinations)}[/]\n"
         )
         console.print(Panel(summary, title="[bold]覆盖率审计 — 摘要[/bold]", border_style=rate_color))
+
+        # 章节热力图（最多显示前 8 个最差章节）
+        if report.section_coverage:
+            worst = [sc for sc in report.section_coverage if sc.coverage_rate < 1.0][:8]
+            if worst:
+                console.print("\n[bold]章节覆盖率（最低 → 最高）：[/bold]")
+                for sc in worst:
+                    pct = sc.coverage_rate * 100
+                    bar = "🔴" if pct < 50 else ("🟠" if pct < 70 else ("🟡" if pct < 90 else "🟢"))
+                    console.print(
+                        f"  {bar} {sc.section[:35]:35s}  "
+                        f"{pct:5.0f}%  (✅{sc.complete} 🟡{sc.weak} ❌{sc.missing})"
+                    )
 
         # 列前 5 条缺失和前 3 条幻觉
         if report.missing_count:
@@ -825,7 +839,8 @@ def audit(
                 p = by_id.get(m.point_id)
                 if not p:
                     continue
-                console.print(f"  [{p.kind}] {p.statement[:80]}")
+                sec_tag = f" [{p.section[:20]}]" if p.section else ""
+                console.print(f"  [{p.kind}]{sec_tag} {p.statement[:80]}")
                 shown += 1
                 if shown >= 5:
                     break
@@ -856,11 +871,19 @@ def config_cmd(
     vault: Optional[str] = typer.Option(None, "--vault", help="Obsidian Vault 目录"),
     output_prefix: Optional[str] = typer.Option(None, "--prefix", help="默认输出文件名前缀，如 SM_ 或 技能_"),
     qpm: Optional[int] = typer.Option(None, "--qpm", help="每分钟 LLM 请求数限制"),
+    profile: Optional[str] = typer.Option(None, "--profile", help="为指定指令设置独立 LLM（如 extract / audit），需配合 --model 使用"),
     show: bool = typer.Option(False, "--show", help="查看当前配置"),
     list_providers: bool = typer.Option(False, "--list-providers", help="列出所有已配置的 provider"),
     test: bool = typer.Option(False, "--test", help="测试 LLM 连接"),
 ):
-    """⚙️  查看或修改 SkillMind 配置"""
+    """⚙️  查看或修改 SkillMind 配置
+
+    示例：
+      skillmind config --model anthropic/claude-sonnet-4-20250514    # 全局模型
+      skillmind config --profile extract --model deepseek/deepseek-chat  # extract 用 deepseek
+      skillmind config --profile audit --model openai/gpt-4o             # audit 用 gpt-4o
+      skillmind config --show                                            # 查看当前配置
+    """
     from skillmind.config import load_config, save_config, _PROVIDER_ENV_MAP
 
     cfg = load_config()
@@ -896,8 +919,20 @@ def config_cmd(
         changed = True
 
     if model:
-        cfg.setdefault("llm", {})["model"] = model
-        console.print(f"[green]✓ LLM 模型:[/green] {model}")
+        if profile:
+            # 设置指定指令的独立 LLM 模型
+            profiles = cfg.setdefault("llm_profiles", {})
+            p_cfg = profiles.setdefault(profile, {})
+            p_cfg["model"] = model
+            # 同时把 api_key / api_base 也写入 profile（若用户一起指定了的话）
+            if api_key is not None:
+                p_cfg["api_key"] = api_key
+            if api_base is not None:
+                p_cfg["api_base"] = api_base
+            console.print(f"[green]✓ [{profile}] 独立模型:[/green] {model}")
+        else:
+            cfg.setdefault("llm", {})["model"] = model
+            console.print(f"[green]✓ LLM 模型:[/green] {model}")
         changed = True
 
     if vault:
