@@ -1,6 +1,6 @@
 """预处理 & 清洗（Cleaner）
 
-职责：将任意网页 URL 转换为干净的 Markdown 正文。
+职责：将任意网页 URL 或本地 HTML 文件转换为干净的 Markdown 正文。
 优先使用 crawl4ai（可选依赖），降级使用 httpx + 简单正则，最终兜底返回原始 HTML。
 
 设计原则：
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Optional
 
 
@@ -39,6 +40,46 @@ def fetch_and_clean(url: str, timeout: int = 30) -> tuple[str, dict]:
 
     # 最终兜底：返回空内容+元信息
     return "", {"source_url": url, "title": "", "author": "", "published_at": ""}
+
+
+def clean_local_html(file_path: str | Path) -> tuple[str, dict]:
+    """
+    读取本地 HTML 文件并转换为 Markdown 正文。
+
+    返回: (markdown_content, metadata)
+    metadata 包含: title, author, published_at, source_path
+    """
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    # 尝试多种编码读取
+    html = ""
+    for enc in ("utf-8", "gbk", "gb2312", "latin-1"):
+        try:
+            html = p.read_text(encoding=enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if not html:
+        html = p.read_bytes().decode("utf-8", errors="replace")
+
+    # 防止超大文件
+    if len(html) > 8 * 1024 * 1024:
+        html = html[:8 * 1024 * 1024]
+
+    md = _html_to_markdown(html)
+
+    metadata = {
+        "source_path": str(p),
+        "title": _extract_title(html) or p.stem,
+        "author": _extract_meta(html, "author"),
+        "published_at": (
+            _extract_meta(html, "article:published_time")
+            or _extract_meta(html, "date")
+        ),
+    }
+    return md, metadata
 
 
 # ---------------------------------------------------------------------------

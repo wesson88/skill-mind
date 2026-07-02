@@ -506,6 +506,78 @@ def ingest_forum(topic_url: str, console=None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# ingest_local_file：本地文件（HTML / TXT 等非 .md 文件）
+# ---------------------------------------------------------------------------
+
+def ingest_local_file(
+    file_path: str,
+    console=None,
+    doc_type: str = "webpage",
+) -> list[dict]:
+    """采集本地 HTML/HTM/TXT 等文件，转换为 Markdown 后缓存。
+
+    Parameters
+    ----------
+    file_path : str
+        本地文件路径（支持 .html / .htm / .txt / .mhtml）。
+    doc_type : str
+        文档类型，默认 "webpage"，可由 auto_detect 后续修正。
+    """
+    ensure_dirs()
+    hashes = _load_hashes()
+
+    p = Path(file_path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    suffix = p.suffix.lower()
+
+    if console:
+        console.print(f"[cyan]读取本地文件:[/cyan] {p}")
+
+    if suffix in (".html", ".htm", ".mhtml"):
+        from skillmind.cleaner import clean_local_html
+        md, metadata = clean_local_html(p)
+    elif suffix == ".txt":
+        # 纯文本直接作为 Markdown
+        md = p.read_text(encoding="utf-8", errors="replace")
+        metadata = {
+            "source_path": str(p),
+            "title": p.stem,
+            "author": "",
+            "published_at": "",
+        }
+    else:
+        raise ValueError(
+            f"不支持的文件类型: {suffix}\n"
+            f"支持: .html / .htm / .mhtml / .txt / .md\n"
+            f"（.md 文件请使用 skillmind ingest skill）"
+        )
+
+    if not md.strip():
+        if console:
+            console.print(f"[yellow]文件内容为空或无法解析:[/yellow] {p.name}")
+        return []
+
+    metadata.setdefault("source_url", "")
+    metadata["source_path"] = str(p)
+    info, is_new = _cache_web_document(
+        content=md, metadata=metadata, doc_type=doc_type, hashes=hashes
+    )
+    if is_new:
+        _save_hashes(hashes)
+
+    if console:
+        title_short = (info.get("title") or p.name)[:60]
+        if is_new:
+            console.print(f"  [green]✓[/green] 已缓存: {title_short}")
+        else:
+            console.print(f"  [yellow]⟳[/yellow] 跳过(已存在): {title_short}")
+
+    return [info]
+
+
+# ---------------------------------------------------------------------------
 # ingest_auto：自动识别输入类型并分派
 # ---------------------------------------------------------------------------
 
@@ -520,14 +592,15 @@ def ingest_auto(
     自动识别 target 类型并调用对应采集器。
 
     返回 (kind, results)，kind 为实际使用的类型字符串：
-      'skill' | 'design_system' | 'rss' | 'url' | 'forum'
+      'skill' | 'design_system' | 'rss' | 'url' | 'forum' | 'local_file'
 
     探测规则（可被 kind_override 覆盖）：
-    1. 本地路径 / .git 结尾 / github.com 仓库根（无 feed/rss 关键词）→ skill
-    2. 含 feed/rss/atom 关键词 或 .xml/.rss/.atom 后缀 → rss
-    3. reddit.com / news.ycombinator.com / Discourse 模式 → forum
-    4. DESIGN.md URL → design_system（文件名模式兜底）
-    5. 其余 http(s) URL → url
+    1. 本地 .html/.htm/.mhtml/.txt 文件 → local_file
+    2. 本地路径（目录或 .md 文件）→ skill
+    3. 含 feed/rss/atom 关键词 或 .xml/.rss/.atom 后缀 → rss
+    4. reddit.com / news.ycombinator.com / Discourse 模式 → forum
+    5. DESIGN.md URL → design_system（文件名模式兜底）
+    6. 其余 http(s) URL → url
 
     采集后自动识别：
     - 对 skill/url/forum 类型，采集后读取内容分析 section 结构，
@@ -540,6 +613,8 @@ def ingest_auto(
         results = ingest_skill(target, console=console)
     elif kind == "design_system":
         results = ingest_skill(target, console=console)
+    elif kind == "local_file":
+        results = ingest_local_file(target, console=console)
     elif kind == "rss":
         results = ingest_rss(target, console=console, max_items=max_items)
     elif kind == "forum":
@@ -549,7 +624,7 @@ def ingest_auto(
         results = ingest_url(target, console=console)
 
     # 采集后自动识别：根据内容结构确定最终 doc_type
-    if kind in ("skill", "design_system", "url", "forum", "rss"):
+    if kind in ("skill", "design_system", "url", "forum", "rss", "local_file"):
         results = _auto_detect_doc_type(results, console=console)
         # kind 应与最终 doc_type 保持一致（便于调用方判断）
         if results:
@@ -716,6 +791,10 @@ def _detect_kind(target: str) -> str:
 
     # 本地路径
     if not t.startswith(("http://", "https://", "git@", "git://")):
+        # 本地 HTML/HTM/TXT 文件 → local_file
+        p = Path(target).expanduser()
+        if p.suffix.lower() in (".html", ".htm", ".mhtml", ".txt"):
+            return "local_file"
         return "skill"
 
     # RSS/Atom Feed 特征

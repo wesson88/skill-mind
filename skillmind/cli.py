@@ -139,6 +139,31 @@ def ingest_forum_cmd(
 
 
 # ---------------------------------------------------------------------------
+# ingest file（本地 HTML / TXT）
+# ---------------------------------------------------------------------------
+
+@ingest_app.command("file")
+def ingest_file_cmd(
+    file_path: str = typer.Argument(..., help="本地文件路径（支持 .html / .htm / .mhtml / .txt）"),
+    doc_type: Optional[str] = typer.Option(None, "--type", "-t", help="指定文档类型: blog / webpage / skill（默认自动识别）"),
+):
+    """📄 采集本地 HTML / TXT 文件，转换为 Markdown 后入库"""
+    from skillmind.collector import ingest_local_file
+
+    dt = doc_type or "webpage"
+    try:
+        results = ingest_local_file(file_path, console=console, doc_type=dt)
+    except Exception as e:
+        console.print(f"[bold red]采集失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+    if results:
+        console.print(f"[green]✓ 已缓存:[/green] {results[0].get('title', file_path)[:60]}")
+    else:
+        console.print("[yellow]未能获取有效内容[/yellow]")
+
+
+# ---------------------------------------------------------------------------
 # ingest auto
 # ---------------------------------------------------------------------------
 
@@ -160,10 +185,11 @@ def ingest_auto_cmd(
         raise typer.Exit(1)
 
     kind_label = {
-        "skill": "📋 skill",
-        "rss":   "📡 rss",
-        "url":   "🔗 url",
-        "forum": "💬 forum",
+        "skill":      "📋 skill",
+        "rss":        "📡 rss",
+        "url":        "🔗 url",
+        "forum":      "💬 forum",
+        "local_file": "📄 local file",
     }.get(detected_kind, detected_kind)
     console.print(f"  [dim]识别类型:[/dim] {kind_label}")
 
