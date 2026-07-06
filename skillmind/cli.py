@@ -787,20 +787,28 @@ def update(
 @app.command()
 def audit(
     source: str = typer.Argument(..., help="source_hash 前缀（≥ 7 位）或路径关键词"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="报告输出路径；默认打印到终端"),
-    max_extracts: int = typer.Option(10, "--max-extracts", help="最多审计的提取笔记数（一文多卡时）"),
-    vault_skills: Optional[str] = typer.Option(None, "--vault-skills", help="覆盖 vault skills 目录路径（用于审计放在非默认 vault 的笔记）"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="写 JSON 结果到文件（默认精简:覆盖率+verdict+缺失项）"),
+    json_output: bool = typer.Option(False, "--json", help="以 JSON 格式打印精简 AuditReport"),
+    json_detailed: bool = typer.Option(False, "--json-detailed", help="以 JSON 格式打印完整 AuditReport(含 items / verify 详细)"),
+    max_extracts: int = typer.Option(20, "--max-extracts", help="最多审计的提取笔记数（一文多卡时）"),
+    vault_skills: Optional[str] = typer.Option(None, "--vault-skills", help="覆盖 vault skills 目录路径"),
 ):
-    """🔬 覆盖率审计：原文 vs vault 提取笔记的逐条对照报告
+    """🔬 覆盖率审计:原文 vs vault 提取卡片(逐条 verbatim 对齐)
 
-    输出：✅ 完整 / 🟡 弱化 / ❌ 缺失 三档统计 + 覆盖率% + 幻觉检测。
-    用作 prompt_version 升级的质量回归基线。
+    流程:
+        Pass 1 — LLM 从原文按章节抽出可验证条目(items)
+        Pass 2 — LLM 对每条 vs 抽取卡片,标 complete / weak / missing + verbatim
+        规则 — 数字 / wikilink 反查(幻觉)+ 跨卡重复(多卡时)
 
-    示例：
-      skillmind audit a1b2c3d                      # 审计单个 source
-      skillmind audit brandkit --output report.md  # 路径关键词 + 写文件
+    verdict:coverage ≥ 90% → PASS(自动放行) / < 90% → FAIL(需人工 review)
+
+    示例:
+      skillmind audit a1b2c3d                  # 终端 summary
+      skillmind audit brandkit --json          # 精简 JSON
+      skillmind audit a1b2c3d -o result.json   # 写精简 JSON
+      skillmind audit brandkit --json-detailed # 完整 JSON(调试用)
     """
-    from skillmind.auditor import audit_source, render_audit_report
+    from skillmind.auditor import audit_source
     from skillmind.config import load_config
 
     cfg = load_config()
@@ -816,81 +824,60 @@ def audit(
         console.print(f"[red]✗ 审计失败:[/red] {e}")
         raise typer.Exit(1)
 
-    md = render_audit_report(report)
-
+    # ---- 写文件 ----
     if output:
+        import json as _json
         out_path = Path(output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(md, encoding="utf-8")
-        console.print(f"[green]✓ 报告已写入:[/green] {out_path}")
-    else:
-        # 终端打印摘要
-        rate_pct = report.coverage_rate * 100
-        rate_uw = report.coverage_rate_unweighted * 100
-        cr_pct = report.complete_rate * 100
-        rate_color = "green" if cr_pct >= 95 else ("yellow" if cr_pct >= 85 else "red")
-
-        # verdict 标签
-        _verdict_style = {
-            "approved": "[bold green]✅ APPROVED[/bold green]",
-            "review":   "[bold yellow]🟡 REVIEW[/bold yellow]",
-            "rejected": "[bold red]❌ REJECTED[/bold red]",
-        }
-        verdict_label = _verdict_style.get(report.verdict, report.verdict)
-
-        summary = (
-            f"原文: {report.source_title[:50]}\n"
-            f"提取笔记: {len(report.extract_files)} 篇  原文: {report.original_chars:,} 字符\n\n"
-            f"atomic 观点总数: [bold]{len(report.points)}[/bold]\n"
-            f"  ✅ 完整: [green]{report.complete_count}[/green]\n"
-            f"  🟡 弱化: [yellow]{report.weak_count}[/yellow]\n"
-            f"  ❌ 缺失: [red]{report.missing_count}[/red]\n"
-            f"  完整保留率: [{rate_color}]{cr_pct:.1f}%[/{rate_color}]"
-            f"  加权: {rate_pct:.1f}%  简单: {rate_uw:.1f}%\n"
-            f"  🚨 疑似幻觉: [{'red' if report.hallucinations else 'dim'}]{len(report.hallucinations)}[/]\n\n"
-            f"  审计结论: {verdict_label}"
+        out_path.write_text(
+            _json.dumps(report.to_summary_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        console.print(Panel(summary, title="[bold]覆盖率审计 — 摘要[/bold]", border_style=rate_color))
+        console.print(f"[green]✓ JSON 已写入:[/green] {out_path}")
+        return
 
-        # 章节热力图（最多显示前 8 个最差章节）
-        if report.section_coverage:
-            worst = [sc for sc in report.section_coverage if sc.coverage_rate < 1.0][:8]
-            if worst:
-                console.print("\n[bold]章节覆盖率（最低 → 最高）：[/bold]")
-                for sc in worst:
-                    pct = sc.coverage_rate * 100
-                    bar = "🔴" if pct < 50 else ("🟠" if pct < 70 else ("🟡" if pct < 90 else "🟢"))
-                    console.print(
-                        f"  {bar} {sc.section[:35]:35s}  "
-                        f"{pct:5.0f}%  (✅{sc.complete} 🟡{sc.weak} ❌{sc.missing})"
-                    )
+    # ---- 终端 JSON 完整输出 ----
+    if json_detailed:
+        import json as _json
+        console.print(_json.dumps(report.to_detailed_dict(), ensure_ascii=False, indent=2))
+        return
 
-        # 列前 5 条缺失和前 3 条幻觉
-        if report.missing_count:
-            console.print("\n[bold red]前 5 条缺失观点：[/bold red]")
-            shown = 0
-            by_id = {p.id: p for p in report.points}
-            for m in report.matches:
-                if m.status != "missing":
-                    continue
-                p = by_id.get(m.point_id)
-                if not p:
-                    continue
-                sec_tag = f" [{p.section[:20]}]" if p.section else ""
-                console.print(f"  [{p.kind}]{sec_tag} {p.statement[:80]}")
-                shown += 1
-                if shown >= 5:
-                    break
+    if json_output:
+        import json as _json
+        console.print(_json.dumps(report.to_summary_dict(), ensure_ascii=False, indent=2))
+        return
 
-        if report.hallucinations:
-            console.print(f"\n[bold red]疑似幻觉（{len(report.hallucinations)} 条）：[/bold red]")
-            for h in report.hallucinations[:3]:
-                console.print(f"  [{h.kind}] {h.value} — {h.note}")
-                console.print(f"    位置：{h.found_in_extract[:80]}")
+    # ---- 终端 summary ----
+    verdict_label = {
+        "PASS": "[bold green]✅ PASS[/bold green]",
+        "FAIL": "[bold red]❌ FAIL[/bold red]",
+    }.get(report.verdict, report.verdict)
+    color = {"PASS": "green", "FAIL": "red"}.get(report.verdict, "white")
 
-        console.print(
-            f"\n[dim]完整报告请加 --output report.md 写入文件[/dim]"
-        )
+    summary = (
+        f"原文: {report.source_title[:60]}\n"
+        f"extract 卡片: {len(report.extract_files)} 张  原文: {report.original_chars:,} 字符  hash: {report.source_hash[:12]}...\n"
+        f"Pass 1: {report.pass1_elapsed:.0f}s  Pass 2: {report.pass2_elapsed:.0f}s\n\n"
+        f"覆盖率: [bold {color}]{report.coverage_weighted:.1f}%[/bold {color}]  "
+        f"missing: {len(report.missing)} 条\n"
+        f"verdict: {verdict_label}\n"
+        f"needs_human_review: {report.needs_human_review}"
+    )
+    console.print(Panel(summary, title="[bold]覆盖率审计[/bold]", border_style=color))
+
+    if report.missing:
+        console.print(f"\n[bold red]缺失项 ({len(report.missing)}):[/bold red]")
+        for i, m in enumerate(report.missing[:10], 1):
+            sec = m.get("section", "?")
+            stmt = m.get("statement", "?")
+            reason = m.get("reason", "")
+            console.print(f"  {i}. [dim]\\[{sec}\\[/dim]] {stmt[:80]}")
+            if reason:
+                console.print(f"     [dim]原因:{reason[:100]}[/dim]")
+        if len(report.missing) > 10:
+            console.print(f"  ... 还有 {len(report.missing) - 10} 条")
+
+    console.print(f"\n[dim]精简 JSON 加 --json / 写文件 -o result.json / 详细 --json-detailed[/dim]")
 
 
 # ---------------------------------------------------------------------------
