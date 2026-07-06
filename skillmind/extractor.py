@@ -256,10 +256,9 @@ def extract_skill(
         # 3. 使用 chunker 分批提取，确保全文覆盖，不硬截断
         llm_cfg = cfg.get("llm", {})
         chunk_size = int(llm_cfg.get("chunk_size_tokens", 3000))
-        chunk_overlap = int(llm_cfg.get("chunk_overlap_tokens", 400))
-        # 每批发给 LLM 的字符上限（默认 24000 ≈ 8000 token，给 prompt 模板留余量）
-        # 较大的 batch 减少切分次数，降低 chunk 边界处的观点遗漏风险
-        batch_chars = int(llm_cfg.get("batch_chars_per_request", 24000))
+        chunk_overlap = int(llm_cfg.get("chunk_overlap_tokens", 200))
+        # 每批发给 LLM 的字符上限（默认 12000 ≈ 4000 token，给 prompt 模板留余量）
+        batch_chars = int(llm_cfg.get("batch_chars_per_request", 12000))
 
         chunker = Chunker(
             chunk_size_tokens=chunk_size,
