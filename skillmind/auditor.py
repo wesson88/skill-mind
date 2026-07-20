@@ -31,6 +31,15 @@ from skillmind.config import (
 
 
 # ---------------------------------------------------------------------------
+# 公共常量
+# ---------------------------------------------------------------------------
+
+# audit 入库阈值:coverage ≥ 此值 → PASS(自动放行),否则 FAIL(人工 review)
+# 下游(se-skill-distill 等)应 import 本常量,避免阈值双轨。
+PASS_COVERAGE_THRESHOLD = 90.0
+
+
+# ---------------------------------------------------------------------------
 # 数据结构
 # ---------------------------------------------------------------------------
 
@@ -685,7 +694,7 @@ def audit_source(
         verify: Pass 2 产出的逐条核对结果
         hallucinations: 规则扫出的疑似幻觉
         duplicates: 跨卡重复句子(单卡时为空)
-        verdict: PASS / WARN / FAIL 单一字符串
+        verdict: PASS / FAIL 单一字符串(coverage ≥ 90% → PASS,否则 FAIL)
         n_complete / n_weak / n_missing / coverage_weighted: 派生统计
     """
     cfg = cfg or load_config()
@@ -794,10 +803,10 @@ def audit_source(
             evidence=f"{d['card_a']} ↔ {d['card_b']}",
         ))
 
-    # verdict:基于 90% 阈值的简单二元判定
-    #   coverage ≥ 90% → PASS(自动放行)
-    #   coverage < 90% → FAIL(需要人工 review)
-    if coverage_weighted >= 90:
+    # verdict:基于 PASS_COVERAGE_THRESHOLD 的二元判定
+    #   coverage ≥ 阈值 → PASS(自动放行)
+    #   coverage < 阈值 → FAIL(需要人工 review)
+    if coverage_weighted >= PASS_COVERAGE_THRESHOLD:
         verdict = "PASS"
         needs_human_review = False
     else:
