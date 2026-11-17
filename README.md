@@ -85,11 +85,16 @@ skillmind edit skill-8f3a1b2
 ### 4. 发布到 Obsidian
 
 ```bash
-# 发布单个
+# 发布单个（默认写入 Obsidian Vault）
 skillmind publish skill-8f3a1b2
 
 # 批量发布全部
 skillmind publish --all
+
+# 可选：同时或只发布为 Agent Skill（<dir>/<name>/SKILL.md）
+skillmind config --skill-dir ~/agent-skills
+skillmind publish skill-8f3a1b2 --format skill
+skillmind publish skill-8f3a1b2 --format both --skill-dir ~/agent-skills
 ```
 
 ### 5. 语义搜索（需安装 chromadb）

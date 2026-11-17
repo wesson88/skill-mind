@@ -420,13 +420,45 @@ def publish(
     all_drafts: bool = typer.Option(False, "--all", help="发布所有 draft/approved 状态草稿"),
     output_dir: Optional[str] = typer.Option(None, "--output-dir", "-o", help="指定输出目录（绝对路径或相对于 vault/skills/ 的子目录）"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="文件名前缀，如 SM_ 或 技能_"),
+    output_format: str = typer.Option(
+        "obsidian",
+        "--format",
+        help="输出格式: obsidian（默认，Vault 笔记）| skill（Agent SKILL.md）| both",
+    ),
+    skill_dir: Optional[str] = typer.Option(
+        None,
+        "--skill-dir",
+        help="Agent SKILL.md 根目录。未传时用 config.skill_dir。仅 --format skill|both 需要",
+    ),
 ):
-    """🚀 将审核通过的草稿发布到 Obsidian Vault"""
+    """🚀 将草稿发布为 Obsidian 笔记（默认）或 Agent SKILL.md
+
+    默认行为与之前一致，只写 Vault 笔记。`skillmind publish --all` 不会改写已有调用方。
+
+    示例：
+      skillmind publish <uuid> --format skill --skill-dir ~/agent-skills
+      skillmind publish <uuid> --format both --skill-dir ~/agent-skills
+    """
     from skillmind.reviewer import list_drafts, get_draft, save_draft
-    from skillmind.renderer import publish_to_vault
-    from skillmind.config import load_config
+    from skillmind.renderer import publish_skill, publish_to_vault
+    from skillmind.config import get_skill_dir, load_config
+
+    fmt = (output_format or "obsidian").strip().lower()
+    if fmt not in ("obsidian", "skill", "both"):
+        console.print("[red]--format 只支持: obsidian | skill | both[/red]")
+        raise typer.Exit(1)
 
     cfg = load_config()
+    resolved_skill_dir = None
+    if fmt in ("skill", "both"):
+        chosen = skill_dir if skill_dir is not None and skill_dir.strip() else None
+        if chosen is None:
+            configured = get_skill_dir(cfg)
+            chosen = str(configured) if configured else None
+        if not chosen:
+            console.print("[red]--format skill|both 需要 --skill-dir，或先 skillmind config --skill-dir <path>[/red]")
+            raise typer.Exit(1)
+        resolved_skill_dir = chosen
 
     if all_drafts:
         targets = [d for d in list_drafts() if d.get("status") in ("draft", "approved")]
@@ -447,23 +479,32 @@ def publish(
     success = 0
     for draft in targets:
         try:
+            # 先标 published，Obsidian front matter 才会写出 status: published / draft: false。
+            # 写盘失败时不 save_draft，磁盘上的草稿状态保持原样。
             draft["status"] = "published"
-            dest = publish_to_vault(draft, cfg=cfg, output_dir=output_dir, prefix=prefix)
+            written: list[str] = []
+            if fmt in ("skill", "both"):
+                written.append(str(publish_skill(draft, resolved_skill_dir)))
+            if fmt in ("obsidian", "both"):
+                written.append(str(publish_to_vault(draft, cfg=cfg, output_dir=output_dir, prefix=prefix)))
             save_draft(draft)
-            console.print(f"[green]✓ 已发布:[/green] {draft.get('meta',{}).get('name','')} → {dest}")
+            console.print(
+                f"[green]✓ 已发布:[/green] {draft.get('meta',{}).get('name','')} → {' ; '.join(written)}"
+            )
             success += 1
         except Exception as e:
             console.print(f"[red]✗ 发布失败:[/red] {draft.get('uuid','')} → {e}")
 
     console.print(f"\n[bold green]发布完成: {success}/{len(targets)}[/bold green]")
 
-    try:
-        from skillmind.search import index_vault
-        index_vault(console=console)
-    except RuntimeError:
-        pass
-    except Exception:
-        pass
+    if fmt in ("obsidian", "both"):
+        try:
+            from skillmind.search import index_vault
+            index_vault(console=console)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +958,11 @@ def config_cmd(
     api_base: Optional[str] = typer.Option(None, "--api-base", help="自定义 API 地址"),
     model: Optional[str] = typer.Option(None, "--model", help="LLM 模型，如 anthropic/claude-3-5-haiku-20241022"),
     vault: Optional[str] = typer.Option(None, "--vault", help="Obsidian Vault 目录"),
+    skill_dir: Optional[str] = typer.Option(
+        None,
+        "--skill-dir",
+        help="Agent SKILL.md 默认输出目录（仅 publish --format skill|both 使用）",
+    ),
     output_prefix: Optional[str] = typer.Option(None, "--prefix", help="默认输出文件名前缀，如 SM_ 或 技能_"),
     qpm: Optional[int] = typer.Option(None, "--qpm", help="每分钟 LLM 请求数限制"),
     profile: Optional[str] = typer.Option(None, "--profile", help="为指定指令设置独立 LLM（如 extract / audit），需配合 --model 使用"),
@@ -986,6 +1032,12 @@ def config_cmd(
     if vault:
         cfg["vault_dir"] = vault
         console.print(f"[green]✓ Vault 目录:[/green] {vault}")
+        changed = True
+
+    if skill_dir is not None:
+        cfg["skill_dir"] = skill_dir.strip()
+        label = cfg["skill_dir"] or "（未设置）"
+        console.print(f"[green]✓ Skill 目录:[/green] {label}")
         changed = True
 
     if output_prefix is not None:

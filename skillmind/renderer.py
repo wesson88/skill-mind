@@ -344,3 +344,258 @@ def publish_to_vault(
     tmp.write_text(md_content, encoding="utf-8")
     tmp.replace(dest)
     return dest
+
+
+# ---------------------------------------------------------------------------
+# Agent Skill（SKILL.md）可选输出
+# ---------------------------------------------------------------------------
+
+_SKILL_NAME_MAX = 64
+_UUID_MARKER = re.compile(r"<!--\s*skillmind-uuid:\s*(.*?)\s*-->")
+
+
+def skill_slug(title: str, *, fallback: str = "skill") -> str:
+    """把笔记标题收成 Agent Skills 要求的 kebab-case 名称。"""
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    fallback_slug = re.sub(r"[^a-z0-9]+", "-", fallback.lower()).strip("-") or "skill"
+    slug = (slug or fallback_slug)[:_SKILL_NAME_MAX].strip("-")
+    return slug or fallback_slug[:_SKILL_NAME_MAX].strip("-") or "skill"
+
+
+def _uuid_suffix(uuid: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]", "", (uuid or "").lower())
+    return (cleaned[-8:] or "skill")
+
+
+def _slug_with_suffix(slug: str, suffix: str) -> str:
+    suffix = re.sub(r"[^a-z0-9]+", "-", suffix.lower()).strip("-") or "x"
+    room = _SKILL_NAME_MAX - len(suffix) - 1
+    base = (slug[: max(room, 1)]).strip("-") or "skill"
+    return f"{base}-{suffix}"[:_SKILL_NAME_MAX].strip("-")
+
+
+def _one_line(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    return text
+
+
+def _as_items(value: Any) -> list[Any]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return [item for item in value if item not in (None, "")]
+    return [value]
+
+
+def skill_description(data: dict) -> str:
+    """When-to-use description, one line, capped at 1024 characters."""
+    meta = data.get("meta") or {}
+    le = data.get("learning_enhancement") or {}
+    intent = _one_line(meta.get("intent"))
+    summary = _one_line(le.get("plain_summary"))
+    name = _one_line(meta.get("name")) or "this skill"
+    lead = intent or summary or name
+    text = lead if lead.lower().startswith("use when") else f"Use when: {lead}"
+    if summary and summary not in text:
+        if text[-1:] not in ".!?。":
+            text += "."
+        text = f"{text} {summary}"
+    triggers = [_one_line(t) for t in _as_items(meta.get("trigger_keywords")) if _one_line(t)]
+    if triggers:
+        if text[-1:] not in ".!?。":
+            text += "."
+        text = f"{text} Triggers: {', '.join(triggers[:8])}."
+    return " ".join(text.split())[:1024].strip()
+
+
+def _source_label(data: dict) -> str:
+    source = data.get("source") or {}
+    url = _one_line(source.get("source_url") or source.get("repo_url"))
+    path = _one_line(source.get("file_path") or source.get("source_path"))
+    if url and path and path not in url:
+        return f"{url} ({path})"
+    return url or path or "local SkillMind cache"
+
+
+def render_skill_markdown(data: dict, *, name: str | None = None) -> str:
+    """把已提取的知识单元渲染为 Agent Skills 风格的 SKILL.md。"""
+    meta = data.get("meta") or {}
+    uuid = str(data.get("uuid") or "unknown")
+    slug = name or skill_slug(
+        str(meta.get("name") or ""),
+        fallback=f"skill-{_uuid_suffix(uuid)}",
+    )
+    description = skill_description(data)
+    fm = yaml.dump(
+        {"name": slug, "description": description},
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+        width=4096,
+    ).strip()
+
+    title = _one_line(meta.get("name")) or slug
+    le = data.get("learning_enhancement") or {}
+    lines = [f"---\n{fm}\n---\n", f"# {title}\n"]
+
+    summary = _one_line(le.get("plain_summary"))
+    if summary:
+        lines.append(summary)
+        lines.append("")
+
+    preconditions = [_one_line(p) for p in _as_items(data.get("preconditions")) if _one_line(p)]
+    if preconditions:
+        lines.append("## Preconditions")
+        lines.append("")
+        for item in preconditions:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    procedure = _as_items(data.get("procedure"))
+    lines.append("## Steps")
+    lines.append("")
+    if procedure:
+        for i, step in enumerate(procedure, start=1):
+            if isinstance(step, dict):
+                action = _one_line(step.get("action") or step.get("step") or "")
+                command = str(step.get("command") or "").strip()
+                seq = step.get("seq") or i
+            else:
+                action = _one_line(step)
+                command = ""
+                seq = i
+            if not action and not command:
+                continue
+            lines.append(f"{seq}. {action or 'Run:'}")
+            if command:
+                lines.append("")
+                lines.append("```")
+                lines.append(command)
+                lines.append("```")
+                lines.append("")
+        if lines[-1] != "":
+            lines.append("")
+    else:
+        lines.append("No executable steps were extracted. Follow the summary above.")
+        lines.append("")
+
+    decisions = _as_items(data.get("decision_points"))
+    rendered_decisions = []
+    for dp in decisions:
+        if isinstance(dp, dict):
+            condition = _one_line(dp.get("condition"))
+            then = _one_line(dp.get("then"))
+            else_ = _one_line(dp.get("else"))
+            if condition or then or else_:
+                rendered_decisions.append((condition, then, else_))
+        else:
+            text = _one_line(dp)
+            if text:
+                rendered_decisions.append((text, "", ""))
+    if rendered_decisions:
+        lines.append("## Decisions")
+        lines.append("")
+        for condition, then, else_ in rendered_decisions:
+            lines.append(f"- {condition or 'Condition'}")
+            if then:
+                lines.append(f"  - Yes: {then}")
+            if else_:
+                lines.append(f"  - No: {else_}")
+        lines.append("")
+
+    halts = [_one_line(h) for h in _as_items(data.get("halt_conditions")) if _one_line(h)]
+    if halts:
+        lines.append("## Halt conditions")
+        lines.append("")
+        for item in halts:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    rollbacks = [_one_line(r) for r in _as_items(data.get("rollback_actions")) if _one_line(r)]
+    if rollbacks:
+        lines.append("## Rollback")
+        lines.append("")
+        for item in rollbacks:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    lines.append("## Source")
+    lines.append("")
+    lines.append(f"Distilled by SkillMind from {_source_label(data)}.")
+    lines.append(f"SkillMind uuid: {uuid}")
+    lines.append(f"<!-- skillmind-uuid: {_marker_uuid(uuid)} -->")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _marker_uuid(uuid: str) -> str:
+    return (uuid or "unknown").replace("-->", "").strip() or "unknown"
+
+
+def _skill_uuid_of(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    matches = list(_UUID_MARKER.finditer(text))
+    return matches[-1].group(1).strip() if matches else None
+
+
+def _dir_available_for(path: Path, uuid: str) -> bool:
+    if not path.exists():
+        return True
+    if not path.is_dir():
+        return False
+    skill_file = path / "SKILL.md"
+    if skill_file.is_file():
+        return _skill_uuid_of(skill_file) == _marker_uuid(uuid)
+    return not any(path.iterdir())
+
+
+def _choose_skill_dir(root: Path, slug: str, uuid: str) -> Path:
+    primary = root / slug
+    if _dir_available_for(primary, uuid):
+        return primary
+    alt = root / _slug_with_suffix(slug, _uuid_suffix(uuid))
+    if _dir_available_for(alt, uuid):
+        return alt
+    return root / _slug_with_suffix(slug, f"{_uuid_suffix(uuid)}2")
+
+
+def _retire_other_owned(root: Path, uuid: str, keep: Path) -> None:
+    """Republish moves a renamed skill instead of leaving a second copy."""
+    if not root.exists():
+        return
+    for skill_file in root.glob("*/SKILL.md"):
+        if skill_file.parent == keep:
+            continue
+        if _skill_uuid_of(skill_file) != _marker_uuid(uuid):
+            continue
+        try:
+            skill_file.unlink()
+            if not any(skill_file.parent.iterdir()):
+                skill_file.parent.rmdir()
+        except OSError:
+            continue
+
+
+def publish_skill(data: dict, skill_dir: str | Path) -> Path:
+    """写入 `<skill_dir>/<name>/SKILL.md`。同一 uuid 再次发布覆盖原文件。"""
+    root = Path(skill_dir).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    meta = data.get("meta") or {}
+    uuid = str(data.get("uuid") or "unknown")
+    slug = skill_slug(
+        str(meta.get("name") or ""),
+        fallback=f"skill-{_uuid_suffix(uuid)}",
+    )
+    dest_dir = _choose_skill_dir(root, slug, uuid)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    text = render_skill_markdown(data, name=dest_dir.name)
+    dest = dest_dir / "SKILL.md"
+    tmp = dest.with_suffix(".md.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(dest)
+    _retire_other_owned(root, uuid, keep=dest_dir)
+    return dest
