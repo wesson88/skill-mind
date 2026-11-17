@@ -147,9 +147,11 @@ def _try_httpx(url: str, timeout: int) -> Optional[tuple[str, dict]]:
     except ImportError:
         return None
 
+    from skillmind import __version__
+
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (compatible; SkillMind/2.0; +https://github.com/wesson88/skill-mind)"
+            f"Mozilla/5.0 (compatible; SkillMind/{__version__}; +https://github.com/wesson88/skill-mind)"
         )
     }
 

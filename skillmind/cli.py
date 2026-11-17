@@ -1,4 +1,4 @@
-"""SkillMind CLI 入口 - 基于 Typer + Rich  (v2.2)"""
+"""SkillMind CLI 入口 - 基于 Typer + Rich。版本号来自打包元数据，不在此处硬编码。"""
 
 from __future__ import annotations
 
@@ -22,6 +22,30 @@ app = typer.Typer(
     add_completion=False,
     rich_markup_mode="rich",
 )
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    from skillmind import __version__
+
+    print(f"skillmind {__version__}")
+    raise typer.Exit()
+
+
+@app.callback()
+def _root(
+    version: Optional[bool] = typer.Option(
+        None,
+        "--version",
+        help="显示版本号并退出",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """🧠 SkillMind - 全源知识提炼系统（Skill / 博客 / 论坛 → Obsidian）"""
+    return
+
 
 # ingest 子命令组
 ingest_app = typer.Typer(
