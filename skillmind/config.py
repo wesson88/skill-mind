@@ -72,6 +72,8 @@ _DEFAULT_CONFIG: dict = {
     # 多 provider Key 存储区，格式: { "anthropic": "sk-ant-xxx", "openai": "sk-xxx", ... }
     "api_keys": {},
     "vault_dir": str(VAULT_DIR),
+    # 仅在 `skillmind publish --format skill|both` 时使用。空字符串表示未设置。
+    "skill_dir": "",
     "auto_approve": False,
     # 输出文件命名：output_prefix 文件名前缀，如 "SM_" 或 "技能_"，空字符串表示不加前缀
     "output_prefix": "",
@@ -131,6 +133,17 @@ def get_vault_dir(cfg: dict | None = None) -> Path:
     if isinstance(raw, str):
         raw = raw.strip()
     return Path(raw) if raw else VAULT_DIR
+
+
+def get_skill_dir(cfg: dict | None = None) -> Path | None:
+    """Agent Skill 输出目录。未配置时返回 None，不影响默认的 Obsidian 发布。"""
+    cfg = cfg or load_config()
+    raw = cfg.get("skill_dir", "")
+    if isinstance(raw, str):
+        raw = raw.strip()
+    if not raw:
+        return None
+    return Path(str(raw)).expanduser()
 
 
 # ---------------------------------------------------------------------------
