@@ -4,6 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skillmind"
+# Distribution version — single source of truth.
+# skillmind.__version__ and `skillmind --version` read this via importlib.metadata.
 version = "2.3.0"
 description = "全源知识提炼系统 - 将 Skill/博客/论坛经验提炼为 Obsidian 知识库"
 readme = "README.md"
