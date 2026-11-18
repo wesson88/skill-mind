@@ -1,57 +1,37 @@
-"""提取引擎（Extractor）v2.2
+"""提取引擎（Extractor）
 
-职责：将单个已缓存的原始文档转成 1~N 张结构化草稿（    "blog": (
-        "- 首先识别文章的所有 H2/H3 小节标题；若无明显标题，按自然段落主题划分内容段。\n"
-        "- 每个小节或内容段必须映射为一个 key_concept 条目（title=小节标题或推断的主题名，\n"
-        "  explanation=该段核心内容，example=代码/示例/引用）。\n"
-        "- 若文章有可执行步骤，同时填入 procedure；作者的核心观点写入 plain_summary。\n"
-        "- 若长文涵盖多个独立主题，按主题拆成多张卡。\n"
-        "- 【覆盖要求】所有小节/段落必须在 key_concepts 或 procedure 中有对应条目，不得遗漏任何段落。\n"
-        "- 【严禁幻觉】key_concepts[].title 必须来自原文真实存在的章节标题或明确命名的概念，"
-        "禁止虚构综合摘要标题。"
-    ),
-    "forum_post": (
-        "- 将主帖问题写入 plain_summary（问题描述）。\n"
-        "- 每个独立的回答/方案必须映射为一个 key_concept 条目\n"
-        "  （title=该方案核心思路的简短命名，explanation=方案详情，example=代码/命令）。\n"
-        "- 不同方案的适用条件写入 decision_points，标记最终采纳方案。\n"
-        "- 【覆盖要求】每个有实质内容的回答都必须在 key_concepts 或 decision_points 中体现。\n"
-        "- 【严禁幻觉】key_concepts[].title 必须来自原文真实存在的章节标题或明确命名的概念，"
-        "禁止虚构综合摘要标题。"
-    ),
-    "webpage": (
-        "- 识别页面的主要区块（如 Hero/Features/Pricing/FAQ 等），每个区块映射为一个 key_concept。\n"
-        "- 若页面含可执行命令或操作步骤，提取到 procedure。\n"
-        "- 页面核心价值主张写入 plain_summary，重要关键词写入 knowledge_tags。\n"
-        "- 【覆盖要求】所有主要区块必须在 key_concepts 中有对应条目，不得只提取显眼标题而忽略内容区块。\n"
-        "- 【严禁幻觉】key_concepts[].title 必须来自原文真实存在的章节标题或明确命名的概念，"
-        "禁止虚构综合摘要标题。"
-    ),RD §4.4 一致）：
-- 动态 Prompt 路由：按 doc_type 选择提取重点。
-- 一文多卡：LLM 可返回 JSON 数组，每项渲染为独立笔记。
-- 可信度 / 过时风险：source_reliability / obsolescence_risk 由 LLM 标注。
-- 提取缓存：同 (source_hash, prompt_version) 命中直接复用，避免重复消费 Token。
-- LLM 失败兜底：超时/JSON 解析失败 → 指数退避重试 → 全部失败后走启发式规则。
-- 凭证缺失（resolve_llm_credentials 抛出）属配置错误，向上抛，不静默降级。
+把缓存原文转成 1~N 张草稿。技能类文档先保留关键约束，再写可执行规则；
+原文没有的槽位标 unknown，不按章节做长篇复述。
+
+缓存键包含 prompt、schema、模型与分块参数。截断 JSON 和失败批次
+不会被写成可复用的完整成功。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from skillmind.config import (
+    CACHE_FORMAT_VERSION,
     CURRENT_PROMPT_VERSION,
     EXTRACT_CACHE_DIR,
+    SCHEMA_VERSION,
     ensure_dirs,
     resolve_llm_credentials,
 )
-from skillmind.chunker import Chunker, join_chunks_for_prompt
+from skillmind.chunker import Chunker, pack_chunks_for_prompt
+from skillmind.gates import norm_ws, quote_in_source, scan_critical_anchors
 from skillmind.parser import _read_text_auto, parse_skill_file
 from skillmind.reviewer import save_draft
+
+
+_UNKNOWN = "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -67,30 +47,27 @@ _DOC_TYPE_LABEL = {
 }
 
 _COMMON_FIDELITY_RULES = (
-    "- 【长列表强制全保留】原文若出现连续 5 条以上的 bullet / numbered list（如 18 个组件、\n"
-    "  20 个 baseline 参数、27 项检查清单），该列表必须 verbatim 完整保留到对应 key_concept 的\n"
-    "  explanation 或 example 字段，禁止用'等'、'诸如此类'、'...'省略；宁可单条 explanation 长一些。\n"
-    "- 【数值阈值 verbatim】原文中出现的 `Choose exactly N`、`1-10 评分`、`clamp(4rem, 10vw, 15rem)`、\n"
-    "  `py-32 md:py-48`、`max-w-...` 等具体数值 / 比例 / 像素值 / 字号 / 计数，必须 verbatim 原样保留，\n"
-    "  禁止概括为'高纪律'、'若干'、'适当'等抽象表述。\n"
-    "- 【禁数字幻觉】严禁在 example、pain_points、plain_summary 中编造原文未出现的精确数字：\n"
-    "  不要凭直觉填 16px / 4:1 / 120px / 24px 等具体值；若举例需要数字，必须来自原文实际出现的数字。\n"
-    "  此约束同样适用 key_concepts[].example 字段 —— 示例段编造数字与主张段编造同样不可；\n"
-    "  原文未给数字时，example 字段宁可保留定性表述（'tiny spacing'）也不要补具体值。\n"
-    "- 【禁 wikilink 幻觉】cross_references 中的 [[xxx]] 必须是原文真实提及的关联名词；\n"
-    "  禁止为了'美化'编造 [[Anti-Generic Design Rules]] 这类原文从未出现的链接目标。"
+    "- 【先约束、后规则】先抽取关键约束、阈值、例外、安全限制和中止条件，"
+    "再写 condition / judgment / action / verification / boundary。\n"
+    "- 【禁止按章节复述】不要为每个章节写 100-500 字解释，不要把列表整段 verbatim 抄进 explanation。"
+    "key_concepts.explanation 只做不超过 80 字的索引，指向对应约束或规则。\n"
+    "- 【未知即 unknown】原文没有写明的槽位填 \"unknown\"。禁止编造阈值、日期、区域、批准条件或命令。\n"
+    "- 【原文依据】每条 constraint 和 rule 必须带 source_quote，即原文中的连续短引。"
+    "找不到原句就写 \"unknown\"，不要另写一句看起来像原文的话。\n"
+    "- 【数值】数字、上限、日期、区域范围放进 constraint.value 和 source_quote，保持原样，"
+    "不要概括成“若干”或“适当”，也不要补原文没有的数字。\n"
+    "- 【禁 wikilink 幻觉】cross_references 中的 [[xxx]] 必须是原文真实提及的关联名词。"
 )
 
 _FOCUS_RULES: dict[str, str] = {
     "skill": (
-        "- 着重提取严格的执行流程（procedure）、决策点（decision_points）、\n"
-        "  命令片段（procedure[].command）、前置条件、中止条件、回滚步骤。\n"
-        "- 保留作者写明的避坑提示（learning_enhancement.pain_points）。\n"
-        "- 对文档中的重要概念、设计原则、方法论提炼到 key_concepts（每项含 title / explanation / example）。\n"
-        "- 【关键】文档中每个具名章节（如'# Reference Style DNA'、'# 2×3 Layout'、'## Visual Modes'等）\n"
-        "  必须作为独立的 key_concept 条目保留，使用原标题作为 title，禁止将多个命名章节合并为一条。\n"
-        "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节标题或明确命名的概念；\n"
-        "  禁止虚构任何综合摘要条目（如'§16-22 综合规则'、'核心规则汇总'等原文中不存在的标题）。\n"
+        "- 这是可执行技能，不是译文。读者要能据此做决定，而不是按章节把原文再读一遍。\n"
+        "- constraints 逐条收录：blanket 批准或拒绝、复审或截止日期、区域策略、"
+        "令牌/速率/递归上限，以及其他 must/never、例外和中止条件。\n"
+        "- rules 只写可执行决策。五个槽位里原文没写的填 unknown，不要用口号补齐。\n"
+        "- halt_conditions 只放原文写明的停止或禁止条件。procedure 只放原文中的操作步骤。\n"
+        "- 具名章节不必各做一条长 key_concept。无法归入约束或规则的术语才保留短索引。\n"
+        "- 【严禁幻觉】title、source_quote 和数值必须能在原文中找到；找不到就写 unknown。\n"
         + _COMMON_FIDELITY_RULES
     ),
     "design_system": (
@@ -105,7 +82,9 @@ _FOCUS_RULES: dict[str, str] = {
         "- 【严禁幻觉】key_concepts 中每个条目的 title 必须来自原文实际存在的章节/区块标题或明确命名的设计概念，\n"
         "  禁止虚构任何综合摘要、汇总或归纳性标题（如'设计原则汇总'、'核心规范'等原文中不存在的标题）。\n"
         "- 【一文多卡】若文档描述多个独立的可复用设计维度（如同时有色彩/字体/布局规则），\n"
-        "  可按维度拆成多张卡，每张聚焦一个维度。"
+        "  可按维度拆成多张卡，每张聚焦一个维度。\n"
+        "- 阈值、例外和禁止项写入 constraints / halt_conditions，不要只留在长篇 explanation 里。\n"
+        + _COMMON_FIDELITY_RULES
     ),
     "blog": (
         "- 提取核心步骤、避坑指南、关键命令片段；\n"
@@ -131,11 +110,11 @@ _FOCUS_RULES: dict[str, str] = {
 }
 
 _SYSTEM_PROMPT = (
-    "你是结构化知识提取助手。你的任务是从给定文档中抽取标准化知识单元，"
+    "你是结构化知识提取助手。先抽取原文有依据的关键约束，再提炼可执行决策规则，"
     "并以严格 JSON 输出。\n"
     "重要：直接输出 JSON，不要附带任何解释、不要使用 Markdown 代码块包裹。\n"
-    "严禁幻觉：所有 key_concepts[].title 必须来自原文真实存在的章节标题或明确命名的概念，"
-    "禁止虚构任何原文中不存在的综合摘要、汇总或归纳性标题。"
+    "不要按章节写长篇复述。原文没有说明的字段填 unknown，禁止编造阈值、日期、区域或命令。\n"
+    "source_quote 必须是原文中的连续短引；找不到就填 unknown。"
 )
 
 _USER_PROMPT_TEMPLATE = """【任务】
@@ -175,8 +154,31 @@ _USER_PROMPT_TEMPLATE = """【任务】
   "halt_conditions": ["停止条件", "..."],
   "rollback_actions": ["回滚动作", "..."],
   "cross_references": ["[[关联笔记名]]", "..."],
+  "constraints": [
+    {
+      "kind": "threshold | exception | safety_limit | abort | policy | other",
+      "statement": "原文中的一条约束，短句，不要写整节译文",
+      "value": "阈值或上限；原文没有则 unknown",
+      "scope": "适用边界；原文没有则 unknown",
+      "source_section": "所在章节标题",
+      "source_quote": "原文连续短引；找不到则 unknown",
+      "support": "sourced | unknown"
+    }
+  ],
+  "rules": [
+    {
+      "condition": "何时",
+      "judgment": "如何判断；原文没有则 unknown",
+      "action": "做什么",
+      "verification": "如何确认做到了；原文没有则 unknown",
+      "boundary": "例外、停止边界或适用范围；原文没有则 unknown",
+      "source_section": "所在章节标题",
+      "source_quote": "原文连续短引；找不到则 unknown",
+      "support": "sourced | unknown"
+    }
+  ],
   "key_concepts": [
-    {"title": "概念/章节/方案名称（来自原文，不可虚构）", "explanation": "详细解释（100-500字，长列表务必完整保留）", "example": "示例或代码片段（可空字符串）"}
+    {"title": "术语或章节名（来自原文，不可虚构）", "explanation": "不超过80字的索引，指向约束或规则，不要复述整节", "example": "原文示例；没有则空字符串"}
   ],
   "learning_enhancement": {
     "pain_points": ["难点 / 避坑", "..."],
@@ -204,6 +206,18 @@ _USER_PROMPT_TEMPLATE = """【任务】
 {content}
 
 请直接输出 JSON。"""
+
+
+# ---------------------------------------------------------------------------
+# 提取结果
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExtractOutcome:
+    units: list[dict]
+    complete: bool
+    truncated: bool = False
+    failed_batches: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -242,19 +256,21 @@ def extract_skill(
 
     doc_type = source_info.get("doc_type", "skill")
     prompt_version = CURRENT_PROMPT_VERSION
+    cache_params = extraction_cache_params(cfg)
 
     # 1. 读取原文
     text = _read_text_auto(raw_p)
 
-    # 2. 提取缓存命中（同一 hash + prompt 版本）
-    cached_units = _load_extract_cache(source_hash, prompt_version)
+    # 2. 只有完整成功的当前参数缓存才能复用
+    cached_units = _load_extract_cache(source_hash, prompt_version, cache_params)
     if cached_units is not None:
         if console:
             console.print("  [dim]提取缓存命中，跳过 LLM 调用[/dim]")
         units = cached_units
+        extract_complete = True
     else:
         # 3. 使用 chunker 分批提取，确保全文覆盖，不硬截断
-        llm_cfg = cfg.get("llm", {})
+        llm_cfg = _merged_llm_cfg(cfg)
         chunk_size = int(llm_cfg.get("chunk_size_tokens", 3000))
         chunk_overlap = int(llm_cfg.get("chunk_overlap_tokens", 200))
         # 每批发给 LLM 的字符上限（默认 12000 ≈ 4000 token，给 prompt 模板留余量）
@@ -278,30 +294,54 @@ def extract_skill(
             if total_chunks <= 1 or len(text) <= batch_chars:
                 # 短文档：单次提取
                 units = _llm_extract(text, doc_type, source_info, cfg, console=console)
+                outcome = ExtractOutcome(units=units, complete=True)
             else:
-                # 长文档：分批提取，合并去重
-                units = _llm_extract_chunked(
+                # 长文档：分批提取，同名卡片合并而不是丢掉后批
+                outcome = _llm_extract_chunked(
                     chunks, batch_chars, doc_type, source_info, cfg, console=console
                 )
+            units = outcome.units
+            extract_complete = outcome.complete
         except _CredentialError:
             raise
         except Exception as e:
             if console:
                 console.print(f"  [yellow]⚠ LLM 提取失败，降级启发式:[/yellow] {e}")
             units = [_heuristic_extract(text, raw_p, source_info)]
+            extract_complete = False
+            outcome = ExtractOutcome(
+                units=units,
+                complete=False,
+                failed_batches=["heuristic"],
+            )
 
-        # 5. 写入提取缓存（仅 LLM/启发式新结果）
-        _save_extract_cache(source_hash, prompt_version, units)
+        # 5. 失败和截断也落盘，但 complete=false，下次不会当成功复用
+        _save_extract_cache(
+            source_hash,
+            prompt_version,
+            units,
+            cache_params,
+            complete=extract_complete,
+            truncated=outcome.truncated,
+            failed_batches=outcome.failed_batches,
+        )
 
     if not units:
         units = [_heuristic_extract(text, raw_p, source_info)]
+        extract_complete = False
 
     # 6. 组装并落盘草稿
     drafts: list[dict] = []
     total = len(units)
     for idx, unit in enumerate(units, start=1):
-        draft = _assemble_draft(unit, source_info, idx=idx, total=total,
-                                prompt_version=prompt_version)
+        draft = _assemble_draft(
+            unit,
+            source_info,
+            idx=idx,
+            total=total,
+            prompt_version=prompt_version,
+            extract_complete=extract_complete,
+        )
         save_draft(draft)
         drafts.append(draft)
 
@@ -318,6 +358,76 @@ class _CredentialError(RuntimeError):
 
 class _EmptyResponseError(ValueError):
     """LLM 返回空数组/空对象；重试无意义，应直接降级启发式。"""
+
+
+class _IncompleteJSONError(ValueError):
+    """截断 JSON 即使能补括号，也不是完整成功。"""
+
+    def __init__(self, message: str, partial: list | None = None):
+        super().__init__(message)
+        self.partial = partial or []
+
+
+def _blank_to_unknown(record: dict, slots: tuple[str, ...]) -> None:
+    for slot in slots:
+        if not str(record.get(slot) or "").strip():
+            record[slot] = _UNKNOWN
+
+
+def _normalize_unit(unit: dict, source_text: str) -> dict:
+    """空槽位写成 unknown。不根据原文编造 quote；对不上原文的引用标 unsupported。"""
+    if not isinstance(unit, dict):
+        return {"constraints": [], "rules": []}
+    constraints: list[dict] = []
+    for raw in unit.get("constraints") or []:
+        if isinstance(raw, str):
+            raw = {"statement": raw}
+        if not isinstance(raw, dict):
+            continue
+        _blank_to_unknown(raw, ("kind", "value", "scope", "source_section"))
+        statement = str(raw.get("statement") or "").strip()
+        quote = str(raw.get("source_quote") or "").strip()
+        if not statement and not quote:
+            continue
+        if not statement:
+            raw["statement"] = _UNKNOWN
+        raw["source_quote"] = quote or _UNKNOWN
+        asserts = statement not in ("", _UNKNOWN)
+        if not quote or quote == _UNKNOWN:
+            raw["support"] = "unsupported" if asserts else _UNKNOWN
+        elif quote_in_source(quote, source_text):
+            raw["support"] = "sourced"
+        else:
+            raw["support"] = "unsupported"
+        constraints.append(raw)
+    unit["constraints"] = constraints
+
+    rules: list[dict] = []
+    for raw in unit.get("rules") or []:
+        if not isinstance(raw, dict):
+            continue
+        _blank_to_unknown(
+            raw,
+            ("condition", "judgment", "action", "verification", "boundary", "source_section"),
+        )
+        quote = str(raw.get("source_quote") or "").strip()
+        asserts = any(not _is_unknown_slot(raw.get(name)) for name in (
+            "condition", "judgment", "action", "verification", "boundary",
+        ))
+        raw["source_quote"] = quote or _UNKNOWN
+        if not quote or quote == _UNKNOWN:
+            raw["support"] = "unsupported" if asserts else _UNKNOWN
+        elif quote_in_source(quote, source_text):
+            raw["support"] = "sourced"
+        else:
+            raw["support"] = "unsupported"
+        rules.append(raw)
+    unit["rules"] = rules
+    return unit
+
+
+def _is_unknown_slot(value: object) -> bool:
+    return norm_ws(str(value or "")).casefold() in {"", _UNKNOWN, "未知", "未说明"}
 
 
 def _normalize_title(title: str) -> str:
@@ -386,6 +496,75 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return inter / union if union else 0.0
 
 
+def _union_dicts(existing: list, incoming: list, key_fn) -> list:
+    merged = [item for item in existing or [] if isinstance(item, dict)]
+    seen = {key_fn(item) for item in merged}
+    seen.discard("")
+    for item in incoming or []:
+        if not isinstance(item, dict):
+            continue
+        key = key_fn(item)
+        if key and key in seen:
+            continue
+        merged.append(item)
+        if key:
+            seen.add(key)
+    return merged
+
+
+def _union_strs(existing: list, incoming: list) -> list:
+    merged = [str(item) for item in existing or [] if str(item).strip()]
+    seen = {_normalize_title(item) for item in merged}
+    for item in incoming or []:
+        text = str(item).strip()
+        key = _normalize_title(text)
+        if not text or (key and key in seen):
+            continue
+        merged.append(text)
+        if key:
+            seen.add(key)
+    return merged
+
+
+def _absorb_unit(existing: dict, incoming: dict) -> None:
+    """把后一批同名卡片的约束、规则和步骤并入先出现的卡。"""
+    existing["key_concepts"] = _union_dicts(
+        existing.get("key_concepts") or [],
+        incoming.get("key_concepts") or [],
+        lambda item: _normalize_title(str(item.get("title") or "")),
+    )
+    existing["constraints"] = _union_dicts(
+        existing.get("constraints") or [],
+        incoming.get("constraints") or [],
+        lambda item: _normalize_title(str(item.get("statement") or item.get("source_quote") or "")),
+    )
+    existing["rules"] = _union_dicts(
+        existing.get("rules") or [],
+        incoming.get("rules") or [],
+        lambda item: _normalize_title(
+            f"{item.get('condition') or ''} {item.get('action') or ''}"
+        ),
+    )
+    existing["decision_points"] = _union_dicts(
+        existing.get("decision_points") or [],
+        incoming.get("decision_points") or [],
+        lambda item: _normalize_title(str(item.get("condition") or "")),
+    )
+    existing["procedure"] = _union_dicts(
+        existing.get("procedure") or [],
+        incoming.get("procedure") or [],
+        lambda item: _normalize_title(str(item.get("action") or "")),
+    )
+    for name in ("halt_conditions", "preconditions", "rollback_actions"):
+        existing[name] = _union_strs(existing.get(name) or [], incoming.get(name) or [])
+
+
+def combine_batch_results(batch_units: list[list[dict]], *, doc_type: str = "skill", console=None) -> list[dict]:
+    """合并各批结果。同名卡片保留后批中新出现的约束和规则。"""
+    flat = [unit for batch in batch_units for unit in batch if isinstance(unit, dict)]
+    return _merge_units(flat, doc_type=doc_type, console=console)
+
+
 def _merge_units(all_units: list[dict], *, doc_type: str = "skill", console=None) -> list[dict]:
     """跨批次合并 units：
 
@@ -405,15 +584,8 @@ def _merge_units(all_units: list[dict], *, doc_type: str = "skill", console=None
         norm_name = _normalize_title(name)
 
         if norm_name and norm_name in name_to_idx:
-            # 已有同名卡：把新卡的 key_concepts 补充进去（新出现的）
-            existing = merged[name_to_idx[norm_name]]
-            existing_kc = existing.get("key_concepts", [])
-            new_kc = unit.get("key_concepts", [])
-            existing_kc_titles = {_normalize_title(k.get("title", "")) for k in existing_kc}
-            for kc in new_kc:
-                if _normalize_title(kc.get("title", "")) not in existing_kc_titles:
-                    existing_kc.append(kc)
-            existing["key_concepts"] = existing_kc
+            # 同名卡合并后批独有的约束、规则和概念，不丢弃后出现的批次。
+            _absorb_unit(merged[name_to_idx[norm_name]], unit)
         else:
             if norm_name:
                 name_to_idx[norm_name] = len(merged)
@@ -437,15 +609,8 @@ def _merge_units(all_units: list[dict], *, doc_type: str = "skill", console=None
             merged_jc.append(unit)
             kc_sets.append(cur_set)
         else:
-            # 合并：把当前卡独有的 key_concepts 补进先出现的卡
             existing = merged_jc[merged_target]
-            existing_kc = existing.get("key_concepts", [])
-            existing_titles = {_normalize_title(k.get("title", ""))
-                               for k in existing_kc if isinstance(k, dict)}
-            for kc in unit.get("key_concepts", []) or []:
-                if isinstance(kc, dict) and _normalize_title(kc.get("title", "")) not in existing_titles:
-                    existing_kc.append(kc)
-            existing["key_concepts"] = existing_kc
+            _absorb_unit(existing, unit)
             kc_sets[merged_target] = _kc_title_set(existing)
             if console:
                 a_name = existing.get("meta", {}).get("name", "")
@@ -531,72 +696,60 @@ def _llm_extract_chunked(
     source_info: dict,
     cfg: dict,
     console=None,
-) -> list[dict]:
-    """将 chunks 分批送给 LLM 提取，合并所有批次结果并去重同名卡片。
+) -> ExtractOutcome:
+    """按预算分批提取。装不下的正文进入下一批，同名卡片再合并。
 
-    合并策略：
-    - 不同批次出现标题相同的卡片 → 保留第一次出现的（通常信息更完整）
-    - 保持各卡片的相对顺序
+    任一批失败或正文被丢弃时，结果 complete=False，不能当完整成功缓存。
     """
-    # 将 chunks 按 batch_chars 组合成多个批次
-    batches: list[list[dict]] = []
-    current_batch: list[dict] = []
-    current_chars = 0
-    for ch in chunks:
-        cost = len(ch["content"]) + 20  # +20 for <<CHUNK N>> marker
-        if current_batch and current_chars + cost > batch_chars:
-            batches.append(current_batch)
-            current_batch = [ch]
-            current_chars = cost
-        else:
-            current_batch.append(ch)
-            current_chars += cost
-    if current_batch:
-        batches.append(current_batch)
-
-    total_batches = len(batches)
-    if console:
-        console.print(f"  [dim]分批提取：共 {total_batches} 批[/dim]")
-
-    all_units: list[dict] = []
-    seen_names: set[str] = set()
-
-    for batch_idx, batch in enumerate(batches, start=1):
-        batch_text, truncated = join_chunks_for_prompt(batch, batch_chars)
+    pending = list(chunks)
+    batch_units: list[list[dict]] = []
+    failed: list = []
+    truncated = False
+    guard = 0
+    while pending:
+        guard += 1
+        if guard > len(chunks) + 8:
+            failed.append("packer-stuck")
+            truncated = True
+            break
+        batch_text, leftover, dropped = pack_chunks_for_prompt(pending, batch_chars)
         if console:
-            status = "（已截尾）" if truncated else ""
             console.print(
-                f"  [dim]  批次 {batch_idx}/{total_batches}：{len(batch_text)} 字符{status}[/dim]"
+                f"  [dim]  批次 {guard}：{len(batch_text)} 字符，剩余 {len(leftover)} 段[/dim]"
             )
+        if dropped or not batch_text.strip():
+            failed.append(guard)
+            truncated = True
+            break
         try:
-            batch_units = _llm_extract(batch_text, doc_type, source_info, cfg, console=console)
+            batch_units.append(
+                _llm_extract(batch_text, doc_type, source_info, cfg, console=console)
+            )
         except _CredentialError:
             raise
         except Exception as e:
             if console:
-                console.print(f"  [yellow]  批次 {batch_idx} 失败，跳过：{e}[/yellow]")
-            continue
+                console.print(f"  [yellow]  批次 {guard} 失败：{e}[/yellow]")
+            failed.append(guard)
+        if not leftover:
+            break
+        if leftover == pending:
+            failed.append("no-progress")
+            truncated = True
+            break
+        pending = leftover
 
-        for unit in batch_units:
-            name = unit.get("meta", {}).get("name", "")
-            norm = _normalize_title(name)
-            if norm and norm in seen_names:
-                continue
-            if norm:
-                seen_names.add(norm)
-            all_units.append(unit)
-
-    if not all_units:
+    if not batch_units:
         raise RuntimeError("所有批次均提取失败")
 
-    # 跨批次去重合并：卡片级 + key_concepts 级 + Jaccard 内容重叠合并
-    merged = _merge_units(all_units, doc_type=doc_type, console=console)
-    if console and len(merged) < len(all_units):
-        console.print(
-            f"  [dim]合并去重：{len(all_units)} 张 → {len(merged)} 张"
-            f"（去除 {len(all_units) - len(merged)} 张重复卡片）[/dim]"
-        )
-    return merged
+    merged = combine_batch_results(batch_units, doc_type=doc_type, console=console)
+    complete = not failed and not truncated
+    return ExtractOutcome(
+        units=merged,
+        complete=complete,
+        truncated=truncated,
+        failed_batches=failed,
+    )
 
 
 def _llm_extract(
@@ -634,13 +787,18 @@ def _llm_extract(
         .replace("{content}", text)
     )
 
-    timeout = int(cfg.get("llm", {}).get("timeout", 120))
-    max_retries = int(cfg.get("llm", {}).get("max_retries", 2))
+    llm_cfg = _merged_llm_cfg(cfg)
+    timeout = int(llm_cfg.get("timeout", 120))
+    max_retries = int(llm_cfg.get("max_retries", 2))
+    temperature = float(llm_cfg.get("temperature", 0.2))
 
     last_err: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return _llm_call_once(creds, user_prompt, timeout=timeout)
+            units = _llm_call_once(
+                creds, user_prompt, timeout=timeout, temperature=temperature,
+            )
+            return [_normalize_unit(unit, text) for unit in units]
         except _CredentialError:
             raise
         except _EmptyResponseError as e:
@@ -660,7 +818,13 @@ def _llm_extract(
     raise RuntimeError(f"LLM 调用 {max_retries+1} 次后仍失败: {last_err}")
 
 
-def _llm_call_once(creds: dict, user_prompt: str, *, timeout: int) -> list[dict]:
+def _llm_call_once(
+    creds: dict,
+    user_prompt: str,
+    *,
+    timeout: int,
+    temperature: float = 0.2,
+) -> list[dict]:
     from litellm import completion  # type: ignore
 
     kwargs: dict[str, Any] = {
@@ -669,7 +833,7 @@ def _llm_call_once(creds: dict, user_prompt: str, *, timeout: int) -> list[dict]
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.2,
+        "temperature": temperature,
         "api_key": creds["api_key"],
         "timeout": timeout,
         "max_tokens": 16384,   # 长文档可能生成大量 key_concepts，防止响应被截断
@@ -763,7 +927,8 @@ def _parse_json_response(text: str) -> list[dict]:
         if last >= 0:
             text = text[:last + 1]
 
-    # 3. 尝试解析，失败则尝试修复截断后再解析
+    # 3. 完整 JSON 才算成功。截断后补括号得到的对象不能当完整结果。
+    incomplete = False
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
@@ -772,18 +937,24 @@ def _parse_json_response(text: str) -> list[dict]:
             parsed = json.loads(fixed)
         except json.JSONDecodeError as e:
             raise ValueError(f"JSON 解析失败（修复后仍无效）: {e}") from e
+        incomplete = True
 
     if isinstance(parsed, dict):
-        return [parsed]
-    if isinstance(parsed, list):
+        units = [parsed]
+    elif isinstance(parsed, list):
         units = [u for u in parsed if isinstance(u, dict)]
         if not units:
-            # 空数组/全非 dict：重试无意义，直接降级启发式
             raise _EmptyResponseError(
                 f"数组中没有有效对象（共 {len(parsed)} 项，类型：{[type(x).__name__ for x in parsed[:3]]}）"
             )
-        return units
-    raise ValueError(f"LLM 响应不是 JSON 对象/数组: {type(parsed).__name__}")
+    else:
+        raise ValueError(f"LLM 响应不是 JSON 对象/数组: {type(parsed).__name__}")
+    if incomplete:
+        raise _IncompleteJSONError(
+            "JSON 被截断，修复结果不能当作完整成功",
+            partial=units,
+        )
+    return units
 
 
 # ---------------------------------------------------------------------------
@@ -853,7 +1024,35 @@ def _heuristic_extract(text: str, raw_path: Path, source_info: dict) -> dict:
     if decision_points:
         types.append("decision-tree")
 
-    return {
+    constraints = []
+    for item in scan_critical_anchors(text):
+        quote = (item.get("anchors") or [""])[0]
+        constraints.append({
+            "kind": item.get("kind") or "constraint",
+            "statement": item.get("statement") or _UNKNOWN,
+            "value": _UNKNOWN,
+            "scope": _UNKNOWN,
+            "source_section": item.get("section") or _UNKNOWN,
+            "source_quote": quote or _UNKNOWN,
+            "support": "sourced" if quote_in_source(quote, text) else "unsupported",
+        })
+    rules = []
+    for point in decision_points:
+        condition = str(point.get("condition") or "").strip()
+        action = str(point.get("then") or "").strip()
+        quote = action if quote_in_source(action, text) else _UNKNOWN
+        rules.append({
+            "condition": condition or _UNKNOWN,
+            "judgment": _UNKNOWN,
+            "action": action or _UNKNOWN,
+            "verification": _UNKNOWN,
+            "boundary": _UNKNOWN,
+            "source_section": condition or _UNKNOWN,
+            "source_quote": quote,
+            "support": "sourced" if quote != _UNKNOWN else "unsupported",
+        })
+
+    return _normalize_unit({
         "meta": {
             "name": title[:60],
             "type": list(dict.fromkeys(types)),
@@ -868,6 +1067,8 @@ def _heuristic_extract(text: str, raw_path: Path, source_info: dict) -> dict:
         "halt_conditions": halt_conditions,
         "rollback_actions": rollback_actions,
         "cross_references": [],
+        "constraints": constraints,
+        "rules": rules,
         "learning_enhancement": {
             "pain_points": notes,
             "plain_summary": summary or title,
@@ -875,7 +1076,7 @@ def _heuristic_extract(text: str, raw_path: Path, source_info: dict) -> dict:
         },
         "source_reliability": "medium",
         "obsolescence_risk": "medium",
-    }
+    }, text)
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +1090,7 @@ def _assemble_draft(
     idx: int,
     total: int,
     prompt_version: str,
+    extract_complete: bool = False,
 ) -> dict:
     """
     把 LLM/启发式输出的 unit 与 source_info 合并为完整草稿。
@@ -945,11 +1147,15 @@ def _assemble_draft(
         "halt_conditions": unit.get("halt_conditions", []),
         "rollback_actions": unit.get("rollback_actions", []),
         "cross_references": unit.get("cross_references", []),
+        "constraints": unit.get("constraints", []),
+        "rules": unit.get("rules", []),
         "key_concepts": unit.get("key_concepts", []),
         "learning_enhancement": unit.get("learning_enhancement", {}),
         "source_reliability": unit.get("source_reliability", "medium"),
         "obsolescence_risk": unit.get("obsolescence_risk", "medium"),
         "prompt_version": prompt_version,
+        "schema_version": SCHEMA_VERSION,
+        "extract_complete": bool(extract_complete),
         "status": "draft",
         "created_at": time.strftime("%Y-%m-%d"),
     }
@@ -959,61 +1165,154 @@ def _assemble_draft(
 # 提取缓存
 # ---------------------------------------------------------------------------
 
-def _extract_cache_path(source_hash: str, prompt_version: str) -> Path:
+def _merged_llm_cfg(cfg: dict) -> dict:
+    llm = dict(cfg.get("llm") or {})
+    profile = (cfg.get("llm_profiles") or {}).get("extract") or {}
+    if isinstance(profile, dict):
+        for key, value in profile.items():
+            if value not in (None, ""):
+                llm[key] = value
+    return llm
+
+
+def extraction_cache_params(cfg: dict | None) -> dict:
+    """影响提取结果的参数。模型、分块和温度变化都会使缓存失效。"""
+    llm = _merged_llm_cfg(cfg or {})
+    return {
+        "model": str(llm.get("model") or ""),
+        "chunk_size_tokens": int(llm.get("chunk_size_tokens", 3000)),
+        "chunk_overlap_tokens": int(llm.get("chunk_overlap_tokens", 200)),
+        "batch_chars_per_request": int(llm.get("batch_chars_per_request", 12000)),
+        "min_chunk_size_tokens": int(llm.get("min_chunk_size_tokens", 100)),
+        "temperature": float(llm.get("temperature", 0.2)),
+        "schema_version": SCHEMA_VERSION,
+    }
+
+
+def cache_param_token(params: dict) -> str:
+    blob = json.dumps(params, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def _extract_cache_path(source_hash: str, prompt_version: str, param_token: str = "") -> Path:
+    if param_token:
+        return EXTRACT_CACHE_DIR / f"{source_hash}_{prompt_version}_{param_token}.json"
     return EXTRACT_CACHE_DIR / f"{source_hash}_{prompt_version}.json"
 
 
-def _load_extract_cache(source_hash: str, prompt_version: str) -> list[dict] | None:
-    p = _extract_cache_path(source_hash, prompt_version)
-    if not p.exists():
+def read_extract_cache_any(path: str | Path) -> dict:
+    """读取旧的裸列表或 v2 信封。旧格式 complete=false，不能冒充当前成功提取。"""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return {
+            "cache_version": 1,
+            "legacy": True,
+            "complete": False,
+            "truncated": False,
+            "failed_batches": [],
+            "schema_version": "legacy",
+            "units": [unit for unit in data if isinstance(unit, dict)],
+        }
+    if isinstance(data, dict) and isinstance(data.get("units"), list):
+        record = dict(data)
+        record.setdefault("legacy", record.get("cache_version", 2) < 2 and not record.get("schema_version"))
+        return record
+    if isinstance(data, dict):
+        return {
+            "cache_version": 1,
+            "legacy": True,
+            "complete": False,
+            "schema_version": "legacy",
+            "units": [data],
+        }
+    raise ValueError(f"无法识别的提取缓存: {path}")
+
+
+def _cache_is_reusable(record: dict, params: dict) -> bool:
+    if not isinstance(record, dict) or record.get("legacy"):
+        return False
+    if not record.get("complete") or record.get("truncated") or record.get("failed_batches"):
+        return False
+    if record.get("schema_version") != params.get("schema_version"):
+        return False
+    if record.get("model") != params.get("model"):
+        return False
+    stored = record.get("params") or {}
+    for key, value in params.items():
+        if stored.get(key) != value:
+            return False
+    units = record.get("units")
+    return isinstance(units, list) and any(isinstance(unit, dict) for unit in units)
+
+
+def _load_extract_cache(source_hash: str, prompt_version: str, params: dict) -> list[dict] | None:
+    path = _extract_cache_path(source_hash, prompt_version, cache_param_token(params))
+    if not path.exists():
         return None
     try:
-        with p.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return [u for u in data if isinstance(u, dict)] or None
-    except (json.JSONDecodeError, OSError):
+        record = read_extract_cache_any(path)
+    except (json.JSONDecodeError, OSError, ValueError):
         return None
-    return None
+    if not _cache_is_reusable(record, params):
+        return None
+    return [unit for unit in record["units"] if isinstance(unit, dict)]
 
 
-def _save_extract_cache(source_hash: str, prompt_version: str, units: list[dict]) -> None:
-    p = _extract_cache_path(source_hash, prompt_version)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(units, f, ensure_ascii=False, indent=2)
-    tmp.replace(p)
+def has_reusable_extract_cache(source_hash: str, cfg: dict) -> bool:
+    return _load_extract_cache(source_hash, CURRENT_PROMPT_VERSION, extraction_cache_params(cfg)) is not None
+
+
+def _save_extract_cache(
+    source_hash: str,
+    prompt_version: str,
+    units: list[dict],
+    params: dict,
+    *,
+    complete: bool,
+    truncated: bool = False,
+    failed_batches: list | None = None,
+) -> None:
+    failures = list(failed_batches or [])
+    reusable = bool(complete) and not truncated and not failures
+    envelope = {
+        "cache_version": CACHE_FORMAT_VERSION,
+        "source_hash": source_hash,
+        "prompt_version": prompt_version,
+        "schema_version": params.get("schema_version", SCHEMA_VERSION),
+        "model": params.get("model", ""),
+        "params": params,
+        "complete": reusable,
+        "truncated": bool(truncated),
+        "failed_batches": failures,
+        "legacy": False,
+        "units": units,
+    }
+    path = _extract_cache_path(source_hash, prompt_version, cache_param_token(params))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(envelope, handle, ensure_ascii=False, indent=2)
+    tmp.replace(path)
 
 
 def clean_stale_extract_caches(console=None) -> int:
-    """清理 extract_cache 目录中旧命名格式的文件（如 *_structure.json、*_evidence.json 等）。
+    """清理旧的 structure/evidence/raw 后缀缓存。
 
-    旧格式：{hash}_{version}_{suffix}.json（含第三段 suffix）
-    新格式：{hash}_{version}.json（仅两段）
-
-    返回删除的文件数。
+    当前文件名是 {hash}_{prompt}_{param_token}.json，不能按“多一段后缀”删除。
     """
     deleted = 0
     if not EXTRACT_CACHE_DIR.exists():
         return 0
-    for f in EXTRACT_CACHE_DIR.glob("*.json"):
-        # 去掉 .json 后缀，按 _ 拆分
-        stem = f.stem  # e.g. "abc123_extract_v1_structure"
-        parts = stem.split("_")
-        # 合法新格式：{hash}_{version} → 拆分后为 [hash, "extract", "v1"]（3段）
-        # 旧格式多了一个 suffix，即 4 段以上
-        # 判断依据：第三个 _ 后还有内容
-        # 格式示例：b0c4837..._extract_v1_structure → stem 含 4+ 部分用 _ 分隔
-        # 用更精确的方式：检查是否匹配 *_extract_v*_*.json（含尾缀词）
-        import re as _re
-        if _re.search(r'_extract_v\d+_.+$', stem):
-            try:
-                f.unlink()
-                deleted += 1
-                if console:
-                    console.print(f"  [dim]删除旧缓存：{f.name}[/dim]")
-            except OSError as e:
-                if console:
-                    console.print(f"  [yellow]删除失败：{f.name}：{e}[/yellow]")
+    legacy = re.compile(r"_extract_v\d+_(structure|evidence|raw)$")
+    for path in EXTRACT_CACHE_DIR.glob("*.json"):
+        if not legacy.search(path.stem):
+            continue
+        try:
+            path.unlink()
+            deleted += 1
+            if console:
+                console.print(f"  [dim]删除旧缓存：{path.name}[/dim]")
+        except OSError as exc:
+            if console:
+                console.print(f"  [yellow]删除失败：{path.name}：{exc}[/yellow]")
     return deleted

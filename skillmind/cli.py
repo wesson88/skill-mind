@@ -59,6 +59,12 @@ app.add_typer(ingest_app, name="ingest")
 console = Console()
 
 
+def _ingest_counts(results: list[dict]) -> tuple[int, int]:
+    """结果里没有 skipped 时按未跳过计，避免 KeyError。"""
+    skipped = sum(1 for row in results if bool(row.get("skipped")))
+    return len(results) - skipped, skipped
+
+
 # ---------------------------------------------------------------------------
 # ingest skill
 # ---------------------------------------------------------------------------
@@ -76,8 +82,7 @@ def ingest_skill_cmd(
         console.print(f"[bold red]采集失败:[/bold red] {e}")
         raise typer.Exit(1)
 
-    new_count = sum(1 for r in results if not r["skipped"])
-    skip_count = sum(1 for r in results if r["skipped"])
+    new_count, skip_count = _ingest_counts(results)
     console.print(
         Panel(
             f"✅ 采集完成\n"
@@ -105,8 +110,7 @@ def ingest_rss_cmd(
         console.print(f"[bold red]采集失败:[/bold red] {e}")
         raise typer.Exit(1)
 
-    new_count = sum(1 for r in results if not r["skipped"])
-    skip_count = sum(1 for r in results if r["skipped"])
+    new_count, skip_count = _ingest_counts(results)
     console.print(
         Panel(
             f"✅ RSS 采集完成\n"
@@ -240,8 +244,8 @@ def extract(
 ):
     """🔬 对缓存内的文档执行 LLM 知识提取，生成草稿（默认只处理未提取过的新文档）"""
     from skillmind.collector import list_cached
-    from skillmind.extractor import extract_skill as _extract, _extract_cache_path
-    from skillmind.config import load_config, get_vault_dir, CURRENT_PROMPT_VERSION
+    from skillmind.extractor import extract_skill as _extract, has_reusable_extract_cache
+    from skillmind.config import load_config, get_vault_dir
 
     cfg = load_config()
     cached = list_cached()
@@ -267,7 +271,7 @@ def extract(
     if not rerun_all and not skill:
         pending = [
             c for c in cached
-            if not _extract_cache_path(c.get("source_hash", ""), CURRENT_PROMPT_VERSION).exists()
+            if not has_reusable_extract_cache(c.get("source_hash", ""), cfg)
         ]
         skipped = len(cached) - len(pending)
         if skipped:
@@ -757,7 +761,12 @@ def status():
     """📊 展示知识库统计信息"""
     from skillmind.reviewer import list_drafts
     from skillmind.collector import list_cached
-    from skillmind.config import load_config, CURRENT_PROMPT_VERSION, get_vault_dir
+    from skillmind.config import (
+        load_config,
+        CURRENT_PROMPT_VERSION,
+        SCHEMA_VERSION,
+        get_vault_dir,
+    )
 
     cfg = load_config()
     cached = list_cached()
@@ -789,6 +798,7 @@ def status():
     table.add_row("旧版 Prompt 笔记", f"[red]{len(old_prompt)}[/red]" if old_prompt else "0")
     table.add_row("Vault 路径", str(vault_dir))
     table.add_row("当前 Prompt 版本", CURRENT_PROMPT_VERSION)
+    table.add_row("当前 Schema", SCHEMA_VERSION)
     table.add_row("LLM 模型", cfg.get("llm", {}).get("model", "未配置"))
 
     console.print(table)
@@ -857,21 +867,21 @@ def audit(
     json_detailed: bool = typer.Option(False, "--json-detailed", help="以 JSON 格式打印完整 AuditReport(含 items / verify 详细)"),
     max_extracts: int = typer.Option(20, "--max-extracts", help="最多审计的提取笔记数（一文多卡时）"),
     vault_skills: Optional[str] = typer.Option(None, "--vault-skills", help="覆盖 vault skills 目录路径"),
+    checklist: Optional[str] = typer.Option(None, "--checklist", help="复用已冻结的检查清单 JSON（id 与 total 保持不变）"),
+    save_checklist: Optional[str] = typer.Option(None, "--save-checklist", help="把本次清单落盘，供前后审计复用"),
 ):
-    """🔬 覆盖率审计:原文 vs vault 提取卡片(逐条 verbatim 对齐)
+    """🔬 双门禁审计：完整性（覆盖率 + 关键保留集）与可执行性
 
     流程:
-        Pass 1 — LLM 从原文按章节抽出可验证条目(items)
-        Pass 2 — LLM 对每条 vs 抽取卡片,标 complete / weak / missing + verbatim
-        规则 — 数字 / wikilink 反查(幻觉)+ 跨卡重复(多卡时)
+        清单 — 复用 --checklist，或 Pass 1 生成后可用 --save-checklist 冻结
+        Pass 2 — 按冻结清单逐条标 complete / weak / missing
+        可执行性 — 规则结构、来源支持、重复。未执行的门是 UNKNOWN，不是 PASS
 
-    verdict:coverage ≥ 90% → PASS(自动放行) / < 90% → FAIL(需人工 review)
+    整体 verdict 只有两道门都是 PASS 才是 PASS。coverage 仍输出，但不能单独放行。
 
     示例:
-      skillmind audit a1b2c3d                  # 终端 summary
-      skillmind audit brandkit --json          # 精简 JSON
-      skillmind audit a1b2c3d -o result.json   # 写精简 JSON
-      skillmind audit brandkit --json-detailed # 完整 JSON(调试用)
+      skillmind audit a1b2c3d --save-checklist checks.json
+      skillmind audit a1b2c3d --checklist checks.json --json
     """
     from skillmind.auditor import audit_source
     from skillmind.config import load_config
@@ -884,6 +894,8 @@ def audit(
                 source, cfg, console=console,
                 max_extract_files=max_extracts,
                 vault_skills_override=vault_skills,
+                checklist_path=checklist,
+                save_checklist_path=save_checklist,
             )
     except Exception as e:
         console.print(f"[red]✗ 审计失败:[/red] {e}")
@@ -916,15 +928,27 @@ def audit(
     verdict_label = {
         "PASS": "[bold green]✅ PASS[/bold green]",
         "FAIL": "[bold red]❌ FAIL[/bold red]",
+        "UNKNOWN": "[bold yellow]❓ UNKNOWN[/bold yellow]",
     }.get(report.verdict, report.verdict)
-    color = {"PASS": "green", "FAIL": "red"}.get(report.verdict, "white")
+    color = {"PASS": "green", "FAIL": "red", "UNKNOWN": "yellow"}.get(report.verdict, "white")
+    coverage_text = "未测" if report.coverage_reported is None else f"{report.coverage_reported:.1f}%"
+    counts = report.counts or {}
+    completeness = report.completeness or {}
+    executability = report.executability or {}
 
     summary = (
         f"原文: {report.source_title[:60]}\n"
         f"extract 卡片: {len(report.extract_files)} 张  原文: {report.original_chars:,} 字符  hash: {report.source_hash[:12]}...\n"
-        f"Pass 1: {report.pass1_elapsed:.0f}s  Pass 2: {report.pass2_elapsed:.0f}s\n\n"
-        f"覆盖率: [bold {color}]{report.coverage_weighted:.1f}%[/bold {color}]  "
-        f"missing: {len(report.missing)} 条\n"
+        f"Pass 1: {report.pass1_elapsed:.0f}s  Pass 2: {report.pass2_elapsed:.0f}s\n"
+        f"清单: {report.checklist_id or '-'}  total: {report.checklist_total}  来源: {report.checklist_source or '-'}\n\n"
+        f"完整性: {completeness.get('status', 'UNKNOWN')}  "
+        f"覆盖率: [bold {color}]{coverage_text}[/bold {color}]  "
+        f"complete/weak/missing/total: "
+        f"{counts.get('complete', 0)}/{counts.get('weak', 0)}/{counts.get('missing', 0)}/{counts.get('total', 0)}\n"
+        f"可执行性: {executability.get('status', 'UNKNOWN')}  "
+        f"结构 {executability.get('structure', 'UNKNOWN')} / "
+        f"来源 {executability.get('source_support', 'UNKNOWN')} / "
+        f"重复 {executability.get('duplication', 'UNKNOWN')}\n"
         f"verdict: {verdict_label}\n"
         f"needs_human_review: {report.needs_human_review}"
     )

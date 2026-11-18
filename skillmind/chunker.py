@@ -106,16 +106,30 @@ class Chunker:
         return _CODE_BLOCK_RE.sub(replacer, text), code_blocks
 
     def _reinsert_code_blocks(self, chunks: list[str], code_blocks: list[dict]) -> list[str]:
-        """把代码块还原到含占位符的 chunk 里。"""
+        """把代码块还原到含占位符的 chunk 里。
+
+        占位符若落在被丢掉的短片段里，或被硬切点拆开，整段代码追加回最近的 chunk，
+        避免 ``` 内的泛型（如 Promise<Task>）消失。
+        """
         if not code_blocks:
             return chunks
         result = []
+        used: set[int] = set()
         for chunk in chunks:
             for block in code_blocks:
                 placeholder = f"<<CODE_BLOCK_{block['index']}>>"
                 if placeholder in chunk:
                     chunk = chunk.replace(placeholder, block["content"])
+                    used.add(block["index"])
+            chunk = re.sub(r"<<CODE_BLOCK_[^>\n]*>>?", "", chunk)
             result.append(chunk)
+        missing = [block for block in code_blocks if block["index"] not in used]
+        if missing:
+            recovered = "\n\n".join(block["content"] for block in missing)
+            if result:
+                result[-1] = result[-1].rstrip() + "\n\n" + recovered
+            else:
+                result = [recovered]
         return result
 
     def _find_semantic_boundaries(self, text: str) -> list[int]:
@@ -172,8 +186,12 @@ class Chunker:
             end_pos = boundaries[min(j, len(boundaries) - 1)]
             chunk_text = text[start_pos:end_pos]
 
+            # 含代码占位符的短片段不能按 min_chunk_size 丢掉，否则占位符无法还原。
+            has_placeholder = "<<CODE_BLOCK_" in chunk_text
             if chunk_text.strip() and (
-                len(text) <= target_size_chars or len(chunk_text) >= min_size_chars
+                len(text) <= target_size_chars
+                or len(chunk_text) >= min_size_chars
+                or has_placeholder
             ):
                 chunks.append(chunk_text)
                 start_positions.append(start_pos)
@@ -216,38 +234,159 @@ class Chunker:
 # 拼回工具：给 extractor 用
 # ---------------------------------------------------------------------------
 
+def _render_chunk(ch: dict) -> str:
+    section = ch.get("source_section", "unknown")
+    return f"<<CHUNK {ch.get('chunk_id', 0)} — SOURCE_SECTION: {section}>>\n{ch.get('content', '')}"
+
+
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+
+
+def _plain_pieces(text: str) -> list[str]:
+    if not text:
+        return []
+    parts = re.split(r"(\n\n+)", text)
+    grouped: list[str] = []
+    buf = ""
+    for part in parts:
+        if not part:
+            continue
+        if buf and len(buf) + len(part) > 400 and not part.startswith("\n"):
+            grouped.append(buf)
+            buf = part
+        else:
+            buf += part
+    if buf:
+        grouped.append(buf)
+    return grouped
+
+
+def _atomic_segments(content: str) -> list[str]:
+    """按代码围栏切段。围栏本身不再拆开，避免切坏泛型或代码。"""
+    segments: list[str] = []
+    pos = 0
+    for match in _FENCE_RE.finditer(content):
+        if match.start() > pos:
+            segments.extend(_plain_pieces(content[pos:match.start()]))
+        segments.append(match.group(0))
+        pos = match.end()
+    if pos < len(content):
+        segments.extend(_plain_pieces(content[pos:]))
+    return [segment for segment in segments if segment]
+
+
+def _split_plain_to_budget(text: str, budget: int) -> list[str]:
+    if len(text) <= budget:
+        return [text] if text else []
+    pieces: list[str] = []
+    buf = ""
+    for line in text.splitlines(keepends=True):
+        if buf and len(buf) + len(line) > budget:
+            pieces.append(buf)
+            buf = ""
+        if len(line) > budget:
+            start = 0
+            while start < len(line):
+                pieces.append(line[start:start + budget])
+                start += budget
+            continue
+        buf += line
+    if buf:
+        pieces.append(buf)
+    return [piece for piece in pieces if piece]
+
+
+def _split_chunk_to_fit(ch: dict, budget_chars: int) -> list[dict]:
+    content = str(ch.get("content", ""))
+    marker_len = len(_render_chunk({**ch, "content": ""}))
+    budget = max(40, budget_chars - marker_len)
+    if len(content) <= budget:
+        return [dict(ch)]
+    pieces: list[str] = []
+    buf = ""
+
+    def flush() -> None:
+        nonlocal buf
+        if buf:
+            pieces.extend(_split_plain_to_budget(buf, budget))
+            buf = ""
+
+    for segment in _atomic_segments(content) or [content]:
+        fenced = segment.startswith("```") and segment.endswith("```")
+        if fenced:
+            flush()
+            pieces.append(segment)
+            continue
+        if not buf:
+            buf = segment
+            continue
+        if len(buf) + len(segment) <= budget:
+            buf += segment
+        else:
+            flush()
+            buf = segment
+    flush()
+    return [
+        {
+            "chunk_id": ch.get("chunk_id", 0),
+            "content": piece,
+            "source_section": ch.get("source_section", "unknown"),
+            "estimated_tokens": ch.get("estimated_tokens", 0),
+            "has_code_block": "```" in piece,
+        }
+        for piece in pieces
+    ] or [dict(ch)]
+
+
+def pack_chunks_for_prompt(
+    chunks: list[dict],
+    max_chars: int,
+) -> tuple[str, list[dict], bool]:
+    """把 chunk 装进字符预算。装不下的整段留在 leftover，不换成短注记。
+
+    返回 (text, leftover_chunks, content_dropped)。
+    content_dropped 只在正文被裁掉且没有进入 leftover 时为 True。
+    单个代码围栏即使超过预算也整段保留。
+    """
+    if not chunks:
+        return "", [], False
+    if max_chars <= 0:
+        return "", list(chunks), True
+
+    parts: list[str] = []
+    used = 0
+    for index, chunk in enumerate(chunks):
+        rendered = _render_chunk(chunk)
+        sep = 2 if parts else 0
+        if used + sep + len(rendered) <= max_chars:
+            parts.append(rendered)
+            used += sep + len(rendered)
+            continue
+
+        room = max_chars - used - sep if parts else max_chars
+        pieces = _split_chunk_to_fit(chunk, room)
+        first_rendered = _render_chunk(pieces[0])
+        rest = pieces[1:] + list(chunks[index + 1:])
+        if used + sep + len(first_rendered) <= max_chars:
+            parts.append(first_rendered)
+            return "\n\n".join(parts), rest, False
+        if not parts:
+            return first_rendered, rest, False
+        return "\n\n".join(parts), list(chunks[index:]), False
+    return "\n\n".join(parts), [], False
+
+
 def join_chunks_for_prompt(
     chunks: list[dict],
     max_chars: int,
 ) -> tuple[str, bool]:
-    """将 chunker.chunk() 输出拼成单一字符串，每个 chunk 前加 <<CHUNK N — SOURCE_SECTION: xxx>> 标记。
+    """将 chunk 拼成带 SOURCE_SECTION 标记的字符串。
 
-    超过 max_chars 时截尾（按整 chunk 丢弃，不在 chunk 内部切），返回 (拼接文本, 是否截尾)。
+    超过 max_chars 时不再丢弃整块、也不再只附加约 50 字的省略注记。
+    返回文本包含全部输入正文。第二项为 True 表示超过预算，调用方应改用
+    pack_chunks_for_prompt 分批发送，并且不得把“超预算”当成内容已经完整裁剪。
     """
     if not chunks:
         return "", False
-
-    parts: list[str] = []
-    used_chars = 0
-    truncated = False
-
-    for ch in chunks:
-        section = ch.get("source_section", "unknown")
-        marker = f"<<CHUNK {ch['chunk_id']} — SOURCE_SECTION: {section}>>\n"
-        body = ch["content"]
-        cost = len(marker) + len(body) + 2  # +2 给两个换行分隔
-
-        if used_chars + cost > max_chars:
-            truncated = True
-            break
-
-        parts.append(marker + body)
-        used_chars += cost
-
-    text = "\n\n".join(parts)
-    if truncated:
-        text += (
-            f"\n\n... (剩余 chunk 因超过预算 {max_chars} 字符已省略，"
-            f"已保留 {len(parts)}/{len(chunks)} 个 chunk)"
-        )
-    return text, truncated
+    text = "\n\n".join(_render_chunk(chunk) for chunk in chunks)
+    return text, len(text) > max_chars

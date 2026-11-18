@@ -29,7 +29,11 @@ CONFIG_FILE = SKILLMIND_HOME / "config.yaml"
 # 提取缓存：同一 source_hash + prompt_version → 直接复用
 EXTRACT_CACHE_DIR = CACHE_DIR / "extract_cache"
 
-CURRENT_PROMPT_VERSION = "extract_v9"
+CURRENT_PROMPT_VERSION = "extract_v10"
+# 带 constraints / rules 的提取结构。旧草稿没有这个身份，不能算当前质量。
+SCHEMA_VERSION = "skill_unit_v2"
+AUDIT_PROMPT_VERSION = "audit_v2"
+CACHE_FORMAT_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # 确保目录存在

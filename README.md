@@ -14,6 +14,9 @@
 - 📄 **渲染**：生成完全兼容 Obsidian Dataview 的 Markdown 笔记
 - 🔍 **搜索**：可选集成 Chroma 向量库，支持语义搜索
 - 🔄 **同步**：监听 Vault 变更，增量更新索引
+- 🧪 **双门禁**：完整性保留 90% 覆盖率并检查关键约束；可执行性单独检查规则、来源和重复。未执行的门是 UNKNOWN
+
+当前版本 **2.4.0**（`extract_v10` / `skill_unit_v2`）。审计清单可以 `--save-checklist` 后用 `--checklist` 复用，前后两次的条目 id 和 total 不变。只看 coverage 不能放行。迁移说明见 `CHANGELOG.md` 和 `使用说明.md`。
 
 ---
 

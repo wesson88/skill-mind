@@ -96,6 +96,8 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
         "obsolescence_risk": obsolescence,
         "parent_source": source.get("parent_source", ""),
         "prompt_version": data.get("prompt_version", ""),
+        "schema_version": data.get("schema_version", ""),
+        "extract_complete": data.get("extract_complete", None),
         "status": data.get("status", "published"),
         "draft": data.get("status", "published") != "published",
         "created": data.get("created_at", time.strftime("%Y-%m-%d")),
@@ -125,6 +127,8 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
     lines.append(
         f"> {doc_label} &nbsp;|&nbsp; 可信度：{rel_badge} &nbsp;|&nbsp; 时效性：{obs_badge}\n"
     )
+    if data.get("extract_complete") is False:
+        lines.append("> ⚠️ 本次提取未完整成功，不能当作当前质量的完成稿。\n")
 
     # --- 一文多卡父文档链接 ---
     if card_total > 1 and source.get("parent_source"):
@@ -135,6 +139,10 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
         lines.append("## 📌 一句话总结")
         lines.append(le["plain_summary"])
         lines.append("")
+
+    # --- 关键约束与决策规则（先于章节复述）---
+    _render_constraints(lines, data.get("constraints") or [])
+    _render_rules(lines, data.get("rules") or [])
 
     # --- 难点注意 ---
     pain_points = le.get("pain_points", [])
@@ -245,6 +253,53 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
     _render_source_footer(lines, source, doc_type)
 
     return "\n".join(lines)
+
+
+def _render_constraints(lines: list[str], constraints: list) -> None:
+    if not constraints:
+        return
+    lines.append("## 📏 关键约束")
+    for item in constraints:
+        if isinstance(item, str):
+            lines.append(f"- **constraint** {item}")
+            continue
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind") or "constraint"
+        statement = item.get("statement") or ""
+        lines.append(f"- **{kind}** {statement}")
+        value = str(item.get("value") or "")
+        if value and value != "unknown":
+            lines.append(f"  - 取值：{value}")
+        scope = str(item.get("scope") or "")
+        if scope and scope != "unknown":
+            lines.append(f"  - 范围：{scope}")
+        quote = str(item.get("source_quote") or "")
+        if quote:
+            lines.append(f"  - 原文：`{quote}`")
+        support = str(item.get("support") or "")
+        if support:
+            lines.append(f"  - 来源支持：{support}")
+    lines.append("")
+
+
+def _render_rules(lines: list[str], rules: list) -> None:
+    if not rules:
+        return
+    lines.append("## 🧭 决策规则")
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        lines.append(f"- 条件：{rule.get('condition') or 'unknown'}")
+        lines.append(f"  - 判定：{rule.get('judgment') or 'unknown'}")
+        lines.append(f"  - 动作：{rule.get('action') or 'unknown'}")
+        lines.append(f"  - 验证：{rule.get('verification') or 'unknown'}")
+        lines.append(f"  - 边界：{rule.get('boundary') or 'unknown'}")
+        lines.append(f"  - 原文：`{rule.get('source_quote') or 'unknown'}`")
+        support = str(rule.get("support") or "")
+        if support:
+            lines.append(f"  - 来源支持：{support}")
+    lines.append("")
 
 
 def _render_source_footer(lines: list[str], source: dict, doc_type: str) -> None:
@@ -442,6 +497,35 @@ def render_skill_markdown(data: dict, *, name: str | None = None) -> str:
     summary = _one_line(le.get("plain_summary"))
     if summary:
         lines.append(summary)
+        lines.append("")
+
+    constraints = [item for item in _as_items(data.get("constraints")) if item]
+    if constraints:
+        lines.append("## Constraints")
+        lines.append("")
+        for item in constraints:
+            if isinstance(item, dict):
+                kind = _one_line(item.get("kind")) or "constraint"
+                statement = _one_line(item.get("statement"))
+                lines.append(f"- **{kind}** {statement}".rstrip())
+                quote = _one_line(item.get("source_quote"))
+                if quote:
+                    lines.append(f"  - source: `{quote}`")
+            else:
+                lines.append(f"- { _one_line(item) }")
+        lines.append("")
+
+    rules = [item for item in _as_items(data.get("rules")) if isinstance(item, dict)]
+    if rules:
+        lines.append("## Rules")
+        lines.append("")
+        for rule in rules:
+            lines.append(f"- When: {_one_line(rule.get('condition')) or 'unknown'}")
+            lines.append(f"  - Judgment: {_one_line(rule.get('judgment')) or 'unknown'}")
+            lines.append(f"  - Action: {_one_line(rule.get('action')) or 'unknown'}")
+            lines.append(f"  - Verification: {_one_line(rule.get('verification')) or 'unknown'}")
+            lines.append(f"  - Boundary: {_one_line(rule.get('boundary')) or 'unknown'}")
+            lines.append(f"  - Source: `{_one_line(rule.get('source_quote')) or 'unknown'}`")
         lines.append("")
 
     preconditions = [_one_line(p) for p in _as_items(data.get("preconditions")) if _one_line(p)]

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import html as html_lib
 import re
 from pathlib import Path
 from typing import Optional
@@ -188,7 +189,47 @@ _NOISE_TAGS = re.compile(
     r"[^>]*>[\s\S]{0,50000}?</\1>",
     re.IGNORECASE,
 )
-_HTML_TAGS = re.compile(r"<[^>]+>")
+# 只去掉真实 HTML 标签。`Promise<Task>` 这类泛型不是标签，不能被 `<[^>]+>` 洗成 `Promise `。
+_HTML_TAG_NAMES = (
+    "a|abbr|address|article|aside|audio|b|base|bdi|bdo|blockquote|body|br|button|"
+    "canvas|caption|cite|code|col|colgroup|data|datalist|dd|del|details|dfn|dialog|div|dl|dt|"
+    "em|embed|fieldset|figcaption|figure|footer|form|h1|h2|h3|h4|h5|h6|head|header|hr|html|"
+    "i|iframe|img|input|ins|kbd|label|legend|li|link|main|map|mark|meta|meter|nav|noscript|"
+    "object|ol|optgroup|option|output|p|picture|pre|progress|q|rp|rt|ruby|s|samp|script|"
+    "section|select|small|source|span|strong|style|sub|summary|sup|svg|table|tbody|td|"
+    "template|textarea|tfoot|th|thead|time|title|tr|track|u|ul|var|video|wbr"
+)
+_HTML_TAGS = re.compile(
+    r"<!--[\s\S]*?-->|<!DOCTYPE[^>]*>|"
+    rf"</?(?:{_HTML_TAG_NAMES})\b[^<>]*?/?>",
+    re.IGNORECASE,
+)
+_CODE_SPAN_RE = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
+
+
+def _strip_html_tags(text: str, replacement: str = "") -> str:
+    return _HTML_TAGS.sub(replacement, text)
+
+
+def _clean_embedded_html(raw: str) -> str:
+    """先去掉格式化标签，再反转义，避免把刚还原的 Promise<Task> 再洗掉。"""
+    return html_lib.unescape(_strip_html_tags(raw, "")).strip()
+
+
+def _mask_code_spans(text: str) -> tuple[str, list[str]]:
+    saved: list[str] = []
+
+    def repl(match: re.Match) -> str:
+        saved.append(match.group(0))
+        return f"\x00CODE{len(saved) - 1}\x00"
+
+    return _CODE_SPAN_RE.sub(repl, text), saved
+
+
+def _unmask_code_spans(text: str, saved: list[str]) -> str:
+    for index, block in enumerate(saved):
+        text = text.replace(f"\x00CODE{index}\x00", block)
+    return text
 _MULTI_BLANK = re.compile(r"\n{3,}")
 _CODE_BLOCK = re.compile(r"<pre[^>]*><code[^>]*>(.*?)</code></pre>", re.DOTALL | re.IGNORECASE)
 _INLINE_CODE = re.compile(r"<code[^>]*>(.*?)</code>", re.DOTALL | re.IGNORECASE)
@@ -203,33 +244,39 @@ def _html_to_markdown(html: str) -> str:
     # 删除噪声区块
     text = _NOISE_TAGS.sub("", html)
 
-    # 代码块优先处理（防止后续被清洗）
+    # 代码块优先处理（防止后续被清洗）。泛型留在代码里。
     def replace_code_block(m: re.Match) -> str:
-        inner = _HTML_TAGS.sub("", m.group(1))
+        inner = _clean_embedded_html(m.group(1))
         return f"\n```\n{inner}\n```\n"
 
     text = _CODE_BLOCK.sub(replace_code_block, text)
-    text = _INLINE_CODE.sub(lambda m: f"`{_HTML_TAGS.sub('', m.group(1))}`", text)
+    text = _INLINE_CODE.sub(lambda m: f"`{_clean_embedded_html(m.group(1))}`", text)
+    text, masked_code = _mask_code_spans(text)
 
     # 标题
     def replace_heading(m: re.Match) -> str:
         level = int(m.group(1))
-        content = _HTML_TAGS.sub("", m.group(2)).strip()
+        content = _strip_html_tags(m.group(2)).strip()
         return f"\n{'#' * level} {content}\n"
 
     text = _H_TAG.sub(replace_heading, text)
 
     # 段落
-    text = _P_TAG.sub(lambda m: f"\n{_HTML_TAGS.sub('', m.group(1)).strip()}\n", text)
+    text = _P_TAG.sub(lambda m: f"\n{_strip_html_tags(m.group(1)).strip()}\n", text)
 
     # 列表
-    text = _LI_TAG.sub(lambda m: f"\n- {_HTML_TAGS.sub('', m.group(1)).strip()}", text)
+    text = _LI_TAG.sub(lambda m: f"\n- {_strip_html_tags(m.group(1)).strip()}", text)
 
     # 链接
-    text = _A_TAG.sub(lambda m: f"[{m.group(2).strip()}]({m.group(1)})", text)
+    text = _A_TAG.sub(
+        lambda m: f"[{_strip_html_tags(m.group(2)).strip()}]({m.group(1)})",
+        text,
+    )
 
-    # 剩余 HTML 标签
-    text = _HTML_TAGS.sub(" ", text)
+    # 剩余真实 HTML 标签。未知的 <Task> 不是标签。
+    text = _strip_html_tags(text, " ")
+    text = html_lib.unescape(text)
+    text = _unmask_code_spans(text, masked_code)
 
     # 多余空行压缩
     text = _MULTI_BLANK.sub("\n\n", text)
@@ -240,7 +287,7 @@ def _html_to_markdown(html: str) -> str:
 def _extract_title(html: str) -> str:
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     if m:
-        return _HTML_TAGS.sub("", m.group(1)).strip()
+        return _strip_html_tags(m.group(1)).strip()
     return ""
 
 
@@ -317,7 +364,7 @@ def parse_rss_feed(feed_url: str, timeout: int = 30) -> list[dict]:
         # 用显式参数传入 item_xml，避免闭包延迟绑定歧义
         def _tag(tag: str, _xml: str = item_xml) -> str:
             m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", _xml, re.DOTALL | re.IGNORECASE)
-            return _HTML_TAGS.sub("", m.group(1)).strip() if m else ""
+            return _strip_html_tags(m.group(1)).strip() if m else ""
 
         link = _tag("link") or _tag("id")
         entries.append({

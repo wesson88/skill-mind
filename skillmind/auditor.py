@@ -23,20 +23,28 @@ from pathlib import Path
 from typing import Any
 
 from skillmind.config import (
+    AUDIT_PROMPT_VERSION,
+    CURRENT_PROMPT_VERSION,
     RAW_DIR,
+    SCHEMA_VERSION,
     get_vault_dir,
     load_config,
     resolve_llm_credentials,
 )
-
-
-# ---------------------------------------------------------------------------
-# 公共常量
-# ---------------------------------------------------------------------------
-
-# audit 入库阈值:coverage ≥ 此值 → PASS(自动放行),否则 FAIL(人工 review)
-# 下游(se-skill-distill 等)应 import 本常量,避免阈值双轨。
-PASS_COVERAGE_THRESHOLD = 90.0
+from skillmind.gates import (
+    PASS_COVERAGE_THRESHOLD,
+    build_audit_summary,
+    checklist_from_items,
+    evaluate_completeness,
+    evaluate_executability,
+    load_checklist,
+    merge_critical_items,
+    notes_are_current,
+    read_frontmatter,
+    require_same_source,
+    save_checklist,
+    units_from_extract_markdown,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,17 +54,19 @@ PASS_COVERAGE_THRESHOLD = 90.0
 @dataclass
 class SourceItem:
     """从 source 抽出的一条可验证条目(Pass 1 的输出)。"""
-    id: int
+    id: str
     section: str
-    kind: str          # rule | concept | procedure_step | enum | number | example | warning | principle | link
+    kind: str          # rule | concept | procedure_step | enum | number | example | warning | principle | link | constraint | threshold | exception | safety_limit | abort
     statement: str
+    critical: bool = False
+    anchors: list[str] = field(default_factory=list)
 
 
 @dataclass
 class VerifyResult:
     """单条 item 在 extract 中的核对结果(Pass 2 的输出)。"""
-    item_id: int
-    status: str        # complete | weak | missing
+    item_id: str
+    status: str        # complete | weak | missing | unverified
     verbatim: str
     location: str      # 在哪张卡的哪一节找到的
     notes: str
@@ -82,8 +92,9 @@ class AuditReport:
         coverage_weighted: 加权覆盖率 (0-100)
         missing: 简化版的 missing 列表(给 se-skill-distill 等下游用)
             每个: {"section", "statement", "reason"}
-        verdict: "PASS" | "FAIL" — coverage ≥ 90% 则 PASS,否则 FAIL
-        needs_human_review: bool — verdict == "FAIL" 时为 True
+        verdict: "PASS" | "FAIL" | "UNKNOWN"
+            只有完整性与可执行性都是 PASS 才是 PASS。未执行的门是 UNKNOWN。
+        needs_human_review: bool — verdict 不是 PASS 时为 True
     """
     source_hash: str
     source_title: str
@@ -98,12 +109,23 @@ class AuditReport:
     # 精简输出字段(默认 JSON)
     missing: list[dict] = field(default_factory=list)        # [{section, statement, reason}]
     coverage_weighted: float = 0.0
-    verdict: str = "unknown"   # PASS | FAIL
+    verdict: str = "UNKNOWN"   # PASS | FAIL | UNKNOWN
     needs_human_review: bool = True
     pass1_elapsed: float = 0.0
     pass2_elapsed: float = 0.0
     audit_time: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
     prompt_version: str = ""
+    schema_version: str = ""
+    completeness: dict = field(default_factory=dict)
+    executability: dict = field(default_factory=dict)
+    counts: dict = field(default_factory=dict)
+    checklist_id: str = ""
+    checklist_total: int = 0
+    checklist_source: str = ""
+    checklist_meta: dict = field(default_factory=dict)
+    quality_current: bool = False
+    coverage_reported: float | None = None
+    summary: dict = field(default_factory=dict)
 
     # 内部详细统计(只用于调试)
     n_complete: int = 0
@@ -115,14 +137,31 @@ class AuditReport:
         return self.to_summary_dict()
 
     def to_summary_dict(self) -> dict:
-        """精简 JSON:覆盖率 + verdict + 缺失项(给下游用)。"""
+        """精简 JSON。保留 coverage / verdict / missing，并给出两道门的状态。"""
+        if self.summary:
+            return self.summary
+        coverage = self.coverage_reported
+        if coverage is None and self.completeness.get("status") not in ("", "UNKNOWN"):
+            coverage = round(self.coverage_weighted, 1)
         return {
             "source_hash": self.source_hash,
             "source_title": self.source_title,
-            "coverage": round(self.coverage_weighted, 1),
+            "coverage": coverage,
             "verdict": self.verdict,
             "needs_human_review": self.needs_human_review,
             "missing": self.missing,
+            "gates": {
+                "completeness": self.completeness.get("status", "UNKNOWN"),
+                "executability": self.executability.get("status", "UNKNOWN"),
+            },
+            "completeness": self.completeness,
+            "executability": self.executability,
+            "counts": self.counts,
+            "checklist": self.checklist_meta,
+            "checklist_source": self.checklist_source,
+            "prompt_version": self.prompt_version,
+            "schema_version": self.schema_version,
+            "quality_current": self.quality_current,
         }
 
     def to_detailed_dict(self) -> dict:
@@ -133,7 +172,8 @@ class AuditReport:
             "source_path": self.source_path,
             "original_chars": self.original_chars,
             "extract_files": self.extract_files,
-            "coverage_weighted": round(self.coverage_weighted, 1),
+            "coverage_weighted": self.coverage_reported if self.coverage_reported is not None else round(self.coverage_weighted, 1),
+            "coverage": self.coverage_reported,
             "verdict": self.verdict,
             "needs_human_review": self.needs_human_review,
             "missing": self.missing,
@@ -149,6 +189,13 @@ class AuditReport:
             "n_complete": self.n_complete,
             "n_weak": self.n_weak,
             "n_missing": self.n_missing,
+            "completeness": self.completeness,
+            "executability": self.executability,
+            "counts": self.counts,
+            "checklist": self.checklist_meta,
+            "checklist_source": self.checklist_source,
+            "schema_version": self.schema_version,
+            "quality_current": self.quality_current,
         }
 
 
@@ -170,7 +217,12 @@ _EXTRACT_ITEMS_PROMPT = """【任务】
 - 一条 item = 一个**可独立验证的具体观点**
 
 【kind 分类】
-- rule            : must / never / ban / avoid 等硬性约束或软建议
+- constraint / threshold / exception / safety_limit / abort
+                  : 关键保留项。每条单独列出，critical=true。
+                    包括 blanket approve、复审或截止日期、区域策略、
+                    token / rate / recursion 上限、must / never、中止条件。
+                    这些不得并进章节摘要。
+- rule            : 其他可执行规则
 - concept         : 定义、解释、原理、原则、说明段
 - procedure_step  : 操作步骤中的单步动作
 - enum            : 列表中的一个类别或一个成员(独立成员各算一条)
@@ -184,6 +236,8 @@ _EXTRACT_ITEMS_PROMPT = """【任务】
 - **同质列表收敛**:8 个调色板 / 8 种视觉模式 / 6 种 layout → 合并为 1 条 enum,
   statement 简短总结(如 "8 种参考调色板:black+cyan+coral 等")
   不要每个成员单独 1 条(否则 8+8+6=22 条不必要的膨胀)
+- **关键约束不合并**:上面的 constraint / threshold / exception / safety_limit / abort
+  每条保留自己的 anchors（原文短引），即使看起来相邻
 - **章节级摘要句**:整段叙事的"原则段"(reference style DNA / core principle) → 1 条 concept 即可,不要拆到每个形容词
 - **重复/冗余检测**:同一句话在多个 bullets 出现 → 只列 1 次
 - **超长 numbered list**(10+ steps) → 1 条 procedure_step 包含序号,不要每步 1 条
@@ -202,8 +256,8 @@ _EXTRACT_ITEMS_PROMPT = """【任务】
 
 【输出 JSON 数组】
 [
-  {"section": "BRAND STRATEGY FIRST", "kind": "rule", "statement": "先用 web search 拿当前行业数据"},
-  {"section": "VISUAL MODES", "kind": "enum", "statement": "共 8 种视觉模式(developer / operator / nature / security / editorial / luxury / voice / cultural)"},
+  {"section": "SAFETY", "kind": "safety_limit", "statement": "禁止 blanket-approve", "critical": true, "anchors": ["Never blanket-approve"]},
+  {"section": "VISUAL MODES", "kind": "enum", "statement": "共 8 种视觉模式", "critical": false, "anchors": []},
   ...
 ]
 
@@ -227,11 +281,14 @@ def _llm_extract_items(source_text: str, cfg: dict) -> list[dict]:
     )
     resp = _call_llm(creds, _AUDIT_SYSTEM_PROMPT, user_prompt, cfg)
     items = _parse_json_array(resp)
-    return [
-        {**it, "id": idx + 1}
-        for idx, it in enumerate(items)
-        if isinstance(it, dict) and str(it.get("statement", "")).strip()
-    ]
+    numbered = []
+    for idx, it in enumerate(items, start=1):
+        if not isinstance(it, dict) or not str(it.get("statement", "")).strip():
+            continue
+        item = dict(it)
+        item["id"] = str(item.get("id") or f"i-{idx:04d}")
+        numbered.append(item)
+    return numbered
 
 
 # ---------------------------------------------------------------------------
@@ -308,23 +365,34 @@ def _llm_verify_extract(items: list[dict], extract_text: str, cfg: dict) -> list
     )
     resp = _call_llm(creds, _AUDIT_SYSTEM_PROMPT, user_prompt, cfg)
     verify = _parse_json_array(resp)
-    by_id: dict[int, dict] = {}
-    for v in verify:
-        if not isinstance(v, dict):
+    by_id: dict[str, dict] = {}
+    for row in verify:
+        if not isinstance(row, dict) or "item_id" not in row:
             continue
-        try:
-            pid = int(v.get("item_id", -1))
-        except (TypeError, ValueError):
+        by_id[str(row.get("item_id")).strip()] = row
+    for it in items:
+        item_id = str(it.get("id") or "")
+        if item_id in by_id:
             continue
-        if pid > 0:
-            by_id[pid] = v
+        match = re.search(r"(\d+)$", item_id)
+        if not match:
+            continue
+        alias = str(int(match.group(1)))
+        owners = []
+        for other in items:
+            other_id = str(other.get("id") or "")
+            tail = re.search(r"(\d+)$", other_id)
+            if tail and str(int(tail.group(1))) == alias:
+                owners.append(other_id)
+        if owners == [item_id] and alias in by_id:
+            by_id[item_id] = by_id[alias]
     return [
         {
-            "item_id": it["id"],
-            "status": (by_id.get(it["id"], {}).get("status", "missing") or "missing").lower(),
-            "verbatim": (by_id.get(it["id"], {}).get("verbatim", "") or "").strip()[:200],
-            "location": (by_id.get(it["id"], {}).get("location", "") or "").strip()[:200],
-            "notes": (by_id.get(it["id"], {}).get("notes", "") or "").strip()[:200],
+            "item_id": str(it["id"]),
+            "status": (by_id.get(str(it["id"]), {}).get("status", "missing") or "missing").lower(),
+            "verbatim": (by_id.get(str(it["id"]), {}).get("verbatim", "") or "").strip()[:200],
+            "location": (by_id.get(str(it["id"]), {}).get("location", "") or "").strip()[:200],
+            "notes": (by_id.get(str(it["id"]), {}).get("notes", "") or "").strip()[:200],
         }
         for it in items
     ]
@@ -680,6 +748,8 @@ def audit_source(
     console=None,
     max_extract_files: int = 20,
     vault_skills_override: str | Path | None = None,
+    checklist_path: str | Path | None = None,
+    save_checklist_path: str | Path | None = None,
 ) -> AuditReport:
     """对一个 source_hash 做覆盖率审计,产出结构化 AuditReport。
 
@@ -694,7 +764,7 @@ def audit_source(
         verify: Pass 2 产出的逐条核对结果
         hallucinations: 规则扫出的疑似幻觉
         duplicates: 跨卡重复句子(单卡时为空)
-        verdict: PASS / FAIL 单一字符串(coverage ≥ 90% → PASS,否则 FAIL)
+        verdict: PASS / FAIL / UNKNOWN。两道门都 PASS 才是 PASS。
         n_complete / n_weak / n_missing / coverage_weighted: 派生统计
     """
     cfg = cfg or load_config()
@@ -720,23 +790,57 @@ def audit_source(
             f"  [dim]原文 {len(raw_text)} 字符,{len(extract_files)} 张 extract 卡片[/dim]"
         )
 
-    # ============ Pass 1:抽 source items ============
-    if console:
-        console.print("  [cyan]Pass 1 — 抽取原文可验证条目...[/cyan]")
+    # ============ 清单：复用冻结清单，或 Pass 1 后冻结 ============
+    frozen = None
+    checklist_source = "absent"
+    pass1_ok = False
+    items_raw: list[dict] = []
     t0 = time.time()
-    try:
-        items_raw = _llm_extract_items(raw_text, cfg)
-    except Exception as e:
+    if checklist_path:
+        frozen = load_checklist(checklist_path)
+        require_same_source(frozen, full_hash)
+        items_raw = [item.to_dict() for item in frozen.items]
+        checklist_source = f"frozen:{frozen.checklist_id}"
+        pass1_ok = True
         if console:
-            console.print(f"  [red]Pass 1 失败:{e}[/red]")
-        items_raw = []
+            console.print(
+                f"  [cyan]复用冻结清单 {frozen.checklist_id}，共 {frozen.total} 条[/cyan]"
+            )
+    else:
+        if console:
+            console.print("  [cyan]Pass 1 — 抽取原文可验证条目...[/cyan]")
+        try:
+            items_raw = merge_critical_items(_llm_extract_items(raw_text, cfg), raw_text)
+            pass1_ok = True
+        except Exception as e:
+            if console:
+                console.print(f"  [red]Pass 1 失败:{e}[/red]")
+            items_raw = []
+            pass1_ok = False
+        if pass1_ok:
+            frozen = checklist_from_items(
+                items_raw,
+                source_hash=full_hash,
+                prompt_version=CURRENT_PROMPT_VERSION,
+                schema_version=SCHEMA_VERSION,
+                audit_prompt_version=AUDIT_PROMPT_VERSION,
+                created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            checklist_source = f"generated:{frozen.checklist_id}"
+            items_raw = [item.to_dict() for item in frozen.items]
+            if save_checklist_path:
+                save_checklist(save_checklist_path, frozen)
+                if console:
+                    console.print(f"  [dim]清单已冻结: {save_checklist_path}[/dim]")
     pass1_elapsed = time.time() - t0
     items = [
         SourceItem(
-            id=it["id"],
+            id=str(it["id"]),
             section=it.get("section", ""),
             kind=it.get("kind", "rule"),
             statement=it.get("statement", ""),
+            critical=bool(it.get("critical")),
+            anchors=list(it.get("anchors") or []),
         )
         for it in items_raw
     ]
@@ -755,23 +859,19 @@ def audit_source(
             f"  [cyan]Pass 2 — 对照 {len(items)} 条 vs {len(extract_files)} 张卡片...[/cyan]"
         )
     t0 = time.time()
+    pass2_ok = False
     try:
-        verify_raw = _llm_verify_extract(items_raw, extract_text, cfg)
+        if not items_raw:
+            verify_raw = []
+        else:
+            verify_raw = _llm_verify_extract(items_raw, extract_text, cfg)
+            pass2_ok = True
     except Exception as e:
         if console:
             console.print(f"  [red]Pass 2 失败:{e}[/red]")
         verify_raw = []
+        pass2_ok = False
     pass2_elapsed = time.time() - t0
-    verify = [
-        VerifyResult(
-            item_id=v["item_id"],
-            status=v["status"] if v["status"] in ("complete", "weak", "missing") else "missing",
-            verbatim=v["verbatim"],
-            location=v["location"],
-            notes=v["notes"],
-        )
-        for v in verify_raw
-    ]
 
     # ============ 规则扫 ============
     if console:
@@ -779,14 +879,83 @@ def audit_source(
     halls = _detect_hallucinations(extract_files, raw_text)
     duplicates = _detect_duplicates_across_cards(extract_files)
 
-    # ============ 派生统计 + verdict ============
-    n_complete = sum(1 for v in verify if v.status == "complete")
-    n_weak = sum(1 for v in verify if v.status == "weak")
-    n_missing = sum(1 for v in verify if v.status == "missing")
-    total = len(verify) or 1
-    coverage_weighted = (n_complete + 0.5 * n_weak) / total * 100
+    # ============ 双门禁 ============
+    local_cover = bool(items) and all(item.anchors for item in items)
+    completeness_executed = bool(frozen) and (pass2_ok or local_cover)
+    verify_by_id = {str(row["item_id"]): row for row in verify_raw} if pass2_ok else {}
+    completeness = evaluate_completeness(
+        frozen.items if frozen else [],
+        verify_by_id,
+        executed=completeness_executed,
+        extract_text=extract_text,
+        source=checklist_source,
+    )
+    prior_by_id = {str(row.get("item_id")): row for row in verify_raw if isinstance(row, dict)}
+    verify = []
+    for row in completeness.get("per_item") or []:
+        prior = prior_by_id.get(str(row["id"]), {})
+        status = row["status"] if row["status"] in ("complete", "weak", "missing", "unverified") else "unverified"
+        verify.append(VerifyResult(
+            item_id=str(row["id"]),
+            status=status,
+            verbatim=str(prior.get("verbatim") or "")[:200],
+            location=str(prior.get("location") or "")[:200],
+            notes=str(prior.get("notes") or row.get("reason") or "")[:200],
+        ))
 
-    # Hallucinations → AuditIssue
+    frontmatters = []
+    extracted_units: list[dict] = []
+    for fp in extract_files:
+        try:
+            note = fp.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        frontmatters.append(read_frontmatter(note))
+        extracted_units.extend(units_from_extract_markdown(note))
+    quality_current = notes_are_current(
+        frontmatters,
+        schema_version=SCHEMA_VERSION,
+        prompt_version=CURRENT_PROMPT_VERSION,
+    )
+    executability = evaluate_executability(
+        extracted_units,
+        raw_text,
+        executed=bool(extract_text.strip()),
+    )
+    # 跨卡相似句保留为 issue。相同决策规则由可执行性门的 duplication 判定，
+    # 避免一句重复的注意事项单独否决整篇。
+    if duplicates and executability.get("status") != "UNKNOWN":
+        executability.setdefault("reasons", []).append(
+            f"{len(duplicates)} cross-card similar sentence(s); informational"
+        )
+
+    note_prompts = sorted({
+        str(fm.get("prompt_version") or "")
+        for fm in frontmatters
+        if fm.get("prompt_version")
+    })
+    note_schemas = sorted({
+        str(fm.get("schema_version") or "")
+        for fm in frontmatters
+        if fm.get("schema_version")
+    })
+    # 顶层身份写笔记自己的 prompt/schema。当前标准写在清单上，避免旧稿被标成 extract_v10。
+    reported_prompt = note_prompts[0] if len(note_prompts) == 1 else CURRENT_PROMPT_VERSION
+    reported_schema = note_schemas[0] if len(note_schemas) == 1 else SCHEMA_VERSION
+    summary = build_audit_summary(
+        source_hash=full_hash,
+        source_title=source_info.get("title", "") or source_info.get("source_path", ""),
+        completeness=completeness,
+        executability=executability,
+        checklist=frozen,
+        checklist_source=checklist_source,
+        prompt_version=reported_prompt,
+        schema_version=reported_schema,
+        quality_current=quality_current,
+    )
+    coverage_value = summary.get("coverage")
+    coverage_weighted = float(coverage_value) if isinstance(coverage_value, (int, float)) else 0.0
+
     issues: list[AuditIssue] = []
     for h in halls:
         issues.append(AuditIssue(
@@ -802,33 +971,17 @@ def audit_source(
             description=f"重复句子 sim={d['similarity']}: {d['text']}",
             evidence=f"{d['card_a']} ↔ {d['card_b']}",
         ))
-
-    # verdict:基于 PASS_COVERAGE_THRESHOLD 的二元判定
-    #   coverage ≥ 阈值 → PASS(自动放行)
-    #   coverage < 阈值 → FAIL(需要人工 review)
-    if coverage_weighted >= PASS_COVERAGE_THRESHOLD:
-        verdict = "PASS"
-        needs_human_review = False
-    else:
-        verdict = "FAIL"
-        needs_human_review = True
-
-    # 填 missing 列表(给 se-skill-distill 等下游用,精简到 section/statement/reason)
-    item_by_id = {it.id: it for it in items}
-    missing_list: list[dict] = []
-    for v in verify:
-        if v.status != "missing":
-            continue
-        it = item_by_id.get(v.item_id)
-        missing_list.append({
-            "section": it.section if it else "",
-            "statement": it.statement if it else "",
-            "reason": v.notes or "extract 未找到该 items",
-        })
+    for missing_constraint in completeness.get("critical_missing") or []:
+        issues.append(AuditIssue(
+            category="critical_missing",
+            severity="blocker",
+            description=missing_constraint.get("statement", ""),
+            evidence=missing_constraint.get("section", ""),
+        ))
 
     return AuditReport(
         source_hash=full_hash,
-        source_title=source_info.get("title", "") or source_info.get("source_path", ""),
+        source_title=summary["source_title"],
         source_path=source_info.get("source_path", "") or source_info.get("source_url", ""),
         original_chars=len(raw_text),
         extract_files=[str(p) for p in extract_files],
@@ -837,14 +990,25 @@ def audit_source(
         duplicates=duplicates,
         hallucinations=halls,
         issues=issues,
-        missing=missing_list,
+        missing=summary["missing"],
         coverage_weighted=coverage_weighted,
-        verdict=verdict,
-        needs_human_review=needs_human_review,
+        verdict=summary["verdict"],
+        needs_human_review=summary["needs_human_review"],
         pass1_elapsed=pass1_elapsed,
         pass2_elapsed=pass2_elapsed,
-        prompt_version=source_info.get("prompt_version", "") or "",
-        n_complete=n_complete,
-        n_weak=n_weak,
-        n_missing=n_missing,
+        prompt_version=reported_prompt,
+        schema_version=reported_schema,
+        completeness=summary["completeness"],
+        executability=summary["executability"],
+        counts=summary["counts"],
+        checklist_id=summary["checklist"]["id"],
+        checklist_total=summary["checklist"]["total"],
+        checklist_source=checklist_source,
+        checklist_meta=summary["checklist"],
+        quality_current=quality_current,
+        coverage_reported=coverage_value if isinstance(coverage_value, (int, float)) else None,
+        summary=summary,
+        n_complete=summary["counts"]["complete"],
+        n_weak=summary["counts"]["weak"],
+        n_missing=summary["counts"]["missing"],
     )
