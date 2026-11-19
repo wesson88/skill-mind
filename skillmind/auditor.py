@@ -883,18 +883,22 @@ def audit_source(
     local_cover = bool(items) and all(item.anchors for item in items)
     completeness_executed = bool(frozen) and (pass2_ok or local_cover)
     verify_by_id = {str(row["item_id"]): row for row in verify_raw} if pass2_ok else {}
+    import re as _re
+    quote_hits = _re.findall(r"原文：`([^`]*)`", extract_text)
     completeness = evaluate_completeness(
         frozen.items if frozen else [],
         verify_by_id,
         executed=completeness_executed,
         extract_text=extract_text,
         source=checklist_source,
+        source_text=raw_text,
+        quotes=quote_hits,
     )
     prior_by_id = {str(row.get("item_id")): row for row in verify_raw if isinstance(row, dict)}
     verify = []
     for row in completeness.get("per_item") or []:
         prior = prior_by_id.get(str(row["id"]), {})
-        status = row["status"] if row["status"] in ("complete", "weak", "missing", "unverified") else "unverified"
+        status = row["status"] if row["status"] in ("complete", "weak", "missing", "unverified", "not_applicable") else "unverified"
         verify.append(VerifyResult(
             item_id=str(row["id"]),
             status=status,
@@ -952,6 +956,8 @@ def audit_source(
         prompt_version=reported_prompt,
         schema_version=reported_schema,
         quality_current=quality_current,
+        hallucination_checked=True,
+        hallucination_count=len(halls),
     )
     coverage_value = summary.get("coverage")
     coverage_weighted = float(coverage_value) if isinstance(coverage_value, (int, float)) else 0.0

@@ -33,7 +33,7 @@ CURRENT_PROMPT_VERSION = "extract_v10"
 # 带 constraints / rules 的提取结构。旧草稿没有这个身份，不能算当前质量。
 SCHEMA_VERSION = "skill_unit_v2"
 AUDIT_PROMPT_VERSION = "audit_v2"
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # 确保目录存在

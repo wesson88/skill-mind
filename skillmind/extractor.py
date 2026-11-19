@@ -220,6 +220,26 @@ class ExtractOutcome:
     failed_batches: list = field(default_factory=list)
 
 
+def _repair_critical_gaps(source: str, gaps: list[dict], cfg: dict, console=None, evidence: list | None = None) -> list[dict]:
+    """只把缺失关键句所在的原文片段再送一次。失败则保持缺口，不假装成功。"""
+    snippets: list[str] = []
+    for gap in gaps[:12]:
+        anchor = str((gap.get("anchors") or [""])[0])
+        idx = source.find(anchor[:80]) if anchor else -1
+        if idx < 0 and anchor:
+            idx = source.lower().find(anchor[:40].lower())
+        snippets.append(source[max(0, idx - 160):idx + 420] if idx >= 0 else anchor)
+    blob = (
+        "下面是原文中尚未进入 constraints/rules 的关键句。只为这些句子补对象，"
+        "source_quote 必须是片段里的连续原文。不要复述整篇。\n\n"
+        + "\n\n---\n\n".join(snippets)
+    )
+    return _llm_extract(
+        blob, "skill", {"title": "", "source_hash": "repair"}, cfg,
+        console=console, evidence=evidence, batch_index=(len(evidence or []) + 1),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 提取入口
 # ---------------------------------------------------------------------------
@@ -290,15 +310,19 @@ def extract_skill(
             )
 
         # 4. LLM 提取（凭证缺失向上抛，让用户配置；其他失败重试 → 启发式）
+        evidence: list[dict] = []
         try:
             if total_chunks <= 1 or len(text) <= batch_chars:
                 # 短文档：单次提取
-                units = _llm_extract(text, doc_type, source_info, cfg, console=console)
+                units = _llm_extract(
+                    text, doc_type, source_info, cfg, console=console, evidence=evidence,
+                )
                 outcome = ExtractOutcome(units=units, complete=True)
             else:
                 # 长文档：分批提取，同名卡片合并而不是丢掉后批
                 outcome = _llm_extract_chunked(
-                    chunks, batch_chars, doc_type, source_info, cfg, console=console
+                    chunks, batch_chars, doc_type, source_info, cfg,
+                    console=console, evidence=evidence,
                 )
             units = outcome.units
             extract_complete = outcome.complete
@@ -314,8 +338,27 @@ def extract_skill(
                 complete=False,
                 failed_batches=["heuristic"],
             )
+            evidence = []
 
-        # 5. 失败和截断也落盘，但 complete=false，下次不会当成功复用
+        from skillmind.gates import find_critical_gaps
+        gaps = find_critical_gaps(text, units)
+        if gaps and extract_complete:
+            try:
+                repaired = _repair_critical_gaps(text, gaps, cfg, console=console, evidence=evidence)
+                if repaired:
+                    units = combine_batch_results([units, repaired], doc_type=doc_type, console=console)
+                gaps = find_critical_gaps(text, units)
+            except _CredentialError:
+                raise
+            except Exception as repair_error:
+                if console:
+                    console.print(f"  [yellow]关键句补提取失败：{repair_error}[/yellow]")
+        if gaps:
+            extract_complete = False
+            if console:
+                console.print(f"  [yellow]仍缺 {len(gaps)} 条关键句，不记为完整成功[/yellow]")
+
+        # 5. 失败、截断和关键缺口都落盘，但 complete=false，下次不会当成功复用
         _save_extract_cache(
             source_hash,
             prompt_version,
@@ -324,6 +367,8 @@ def extract_skill(
             complete=extract_complete,
             truncated=outcome.truncated,
             failed_batches=outcome.failed_batches,
+            batches=evidence,
+            critical_gaps=[str((gap.get("anchors") or [""])[0])[:180] for gap in gaps],
         )
 
     if not units:
@@ -696,6 +741,7 @@ def _llm_extract_chunked(
     source_info: dict,
     cfg: dict,
     console=None,
+    evidence: list | None = None,
 ) -> ExtractOutcome:
     """按预算分批提取。装不下的正文进入下一批，同名卡片再合并。
 
@@ -723,7 +769,10 @@ def _llm_extract_chunked(
             break
         try:
             batch_units.append(
-                _llm_extract(batch_text, doc_type, source_info, cfg, console=console)
+                _llm_extract(
+                    batch_text, doc_type, source_info, cfg, console=console,
+                    evidence=evidence, batch_index=guard,
+                )
             )
         except _CredentialError:
             raise
@@ -758,6 +807,8 @@ def _llm_extract(
     source_info: dict,
     cfg: dict,
     console=None,
+    evidence: list | None = None,
+    batch_index: int = 1,
 ) -> list[dict]:
     """调用 LLM 并解析 JSON。失败按 max_retries 指数退避重试。"""
     try:
@@ -795,9 +846,13 @@ def _llm_extract(
     last_err: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            units = _llm_call_once(
+            units, raw = _llm_call_once(
                 creds, user_prompt, timeout=timeout, temperature=temperature,
             )
+            if evidence is not None:
+                evidence.append(_evidence_record(
+                    user_prompt, raw, index=batch_index, truncated=False,
+                ))
             return [_normalize_unit(unit, text) for unit in units]
         except _CredentialError:
             raise
@@ -843,7 +898,7 @@ def _llm_call_once(
 
     resp = completion(**kwargs)
     raw = (resp.choices[0].message.content or "").strip()
-    return _parse_json_response(raw)
+    return _parse_json_response(raw), raw
 
 
 _CODEBLOCK_RE = re.compile(r"```(?:json|JSON)?\s*\n([\s\S]{1,30000}?)```")
@@ -1231,7 +1286,9 @@ def read_extract_cache_any(path: str | Path) -> dict:
 def _cache_is_reusable(record: dict, params: dict) -> bool:
     if not isinstance(record, dict) or record.get("legacy"):
         return False
-    if not record.get("complete") or record.get("truncated") or record.get("failed_batches"):
+    if not record.get("complete") or record.get("truncated") or record.get("failed_batches") or record.get("critical_gaps"):
+        return False
+    if int(record.get("cache_version") or 0) != CACHE_FORMAT_VERSION:
         return False
     if record.get("schema_version") != params.get("schema_version"):
         return False
@@ -1262,6 +1319,20 @@ def has_reusable_extract_cache(source_hash: str, cfg: dict) -> bool:
     return _load_extract_cache(source_hash, CURRENT_PROMPT_VERSION, extraction_cache_params(cfg)) is not None
 
 
+def _redact_secrets(text: str) -> str:
+    return re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "[redacted]", text or "")
+
+
+def _evidence_record(prompt: str, raw: str, *, index: int, truncated: bool) -> dict:
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    return {
+        "index": index,
+        "prompt_sha256": digest,
+        "raw_response": _redact_secrets(raw),
+        "truncated": bool(truncated),
+    }
+
+
 def _save_extract_cache(
     source_hash: str,
     prompt_version: str,
@@ -1271,9 +1342,12 @@ def _save_extract_cache(
     complete: bool,
     truncated: bool = False,
     failed_batches: list | None = None,
+    batches: list | None = None,
+    critical_gaps: list | None = None,
 ) -> None:
     failures = list(failed_batches or [])
-    reusable = bool(complete) and not truncated and not failures
+    gaps = list(critical_gaps or [])
+    reusable = bool(complete) and not truncated and not failures and not gaps
     envelope = {
         "cache_version": CACHE_FORMAT_VERSION,
         "source_hash": source_hash,
@@ -1284,6 +1358,12 @@ def _save_extract_cache(
         "complete": reusable,
         "truncated": bool(truncated),
         "failed_batches": failures,
+        "critical_gaps": gaps,
+        "batches": [
+            {key: value for key, value in batch.items() if key != "api_key"}
+            for batch in (batches or [])
+            if isinstance(batch, dict)
+        ],
         "legacy": False,
         "units": units,
     }

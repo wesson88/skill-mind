@@ -12,6 +12,13 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from skillmind.fidelity import (
+    anchor_retained,
+    assess_faithfulness,
+    is_placeholder_only,
+    obligation_anchor,
+)
+
 
 # 下游（含 se-skill-distill）应继续从 skillmind.auditor 导入此常量。
 # auditor 再从这里导出，避免两套阈值。
@@ -42,6 +49,18 @@ _SLOGAN_ACTION = re.compile(
 )
 
 _CRITICAL_LINE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("safety_limit", re.compile(r"authoriz|\bIDOR\b|鉴权|每(?:个|一)?请求.{0,24}授权", re.IGNORECASE)),
+    ("safety_limit", re.compile(r"shape check|well-formedness, not authorization|形状检查", re.IGNORECASE)),
+    ("safety_limit", re.compile(r"never a label|不得作为标签|禁止.{0,6}标签", re.IGNORECASE)),
+    ("exception", re.compile(r"when not to use|single-line fix|typo correction", re.IGNORECASE)),
+    ("exception", re.compile(r"skip this phase", re.IGNORECASE)),
+    ("abort", re.compile(r"stop your turn|write code in this turn", re.IGNORECASE)),
+    ("constraint", re.compile(r"kebab-case", re.IGNORECASE)),
+    ("constraint", re.compile(r"\bno cycles\b|不得有环", re.IGNORECASE)),
+    ("constraint", re.compile(r"one change per delta|provider module's spec", re.IGNORECASE)),
+    ("constraint", re.compile(r"imported before anything else|must be imported before", re.IGNORECASE)),
+    ("abort", re.compile(r"blocks merge|阻断合并", re.IGNORECASE)),
+    ("constraint", re.compile(r"SELECT.{0,80}INSERT|different body|three outcomes|longest retry|treat as untrusted", re.IGNORECASE)),
     ("safety_limit", re.compile(r"blanket[-\s]?approv", re.IGNORECASE)),
     ("threshold", re.compile(
         r"(review|re-?review|复审|延期).{0,48}(\d{4}-\d{2}-\d{2}|date|日期)"
@@ -241,18 +260,44 @@ def scan_critical_anchors(source_text: str) -> list[dict]:
         kind = _kind_for_line(text)
         if not kind:
             continue
-        key = norm_ws(text).casefold()
+        anchor = obligation_anchor(text)
+        if not anchor:
+            continue
+        key = norm_ws(anchor).casefold()
         if key in seen:
             continue
         seen.add(key)
         found.append({
             "section": heading,
             "kind": kind,
-            "statement": text[:160],
+            "statement": anchor[:160],
             "critical": True,
-            "anchors": [text[:240]],
+            "anchors": [anchor[:240]],
         })
     return found
+
+
+def find_critical_gaps(source_text: str, units: list[dict]) -> list[dict]:
+    """原文里的关键句在 units 中没有锚点、同段引文或风险类等价表述。"""
+    from skillmind.fidelity import gaps_for_lines
+    return gaps_for_lines(source_text, units, scan_critical_anchors(source_text))
+
+
+def recover_critical_gaps(source_text: str, units: list[dict], llm_fn=None) -> tuple[list[dict], list[dict]]:
+    """缺口仍在则第二项非空，调用方不得把结果当成完整成功。llm_fn 缺省时不调用模型。"""
+    gaps = find_critical_gaps(source_text, units)
+    if not gaps or llm_fn is None:
+        return list(units), gaps
+    added = llm_fn(source_text, gaps) or []
+    merged = list(units)
+    if added:
+        merged.append({"constraints": [], "rules": [], "key_concepts": []})
+        for unit in added:
+            if not isinstance(unit, dict):
+                continue
+            merged[-1].setdefault("constraints", []).extend(unit.get("constraints") or [])
+            merged[-1].setdefault("rules", []).extend(unit.get("rules") or [])
+    return merged, find_critical_gaps(source_text, merged)
 
 
 def merge_critical_items(raw_items: list[dict], source_text: str) -> list[dict]:
@@ -317,14 +362,26 @@ def checklist_from_items(
 # 完整性
 # ---------------------------------------------------------------------------
 
-def _anchor_status(item: ChecklistItem, extract_text: str | None) -> str | None:
+def _anchor_status(
+    item: ChecklistItem,
+    extract_text: str | None,
+    *,
+    source_text: str = "",
+    quotes: list[str] | None = None,
+) -> str | None:
     if not item.anchors or extract_text is None:
         return None
-    haystack = norm_ws(extract_text).casefold()
+    quotes = quotes or []
     for anchor in item.anchors:
-        needle = norm_ws(anchor).casefold()
-        if len(needle) >= 8 and needle in haystack:
+        kept = obligation_anchor(anchor) or anchor
+        if is_placeholder_only(anchor) and obligation_anchor(anchor) is None:
+            continue
+        if anchor_retained(kept, source_text=source_text, extract_text=extract_text, quotes=quotes):
             return "complete"
+    if any(is_placeholder_only(anchor) for anchor in item.anchors) and all(
+        obligation_anchor(anchor) is None for anchor in item.anchors
+    ):
+        return "not_applicable"
     return "missing"
 
 
@@ -332,12 +389,23 @@ def resolve_item_status(
     item: ChecklistItem,
     reported: str | None,
     extract_text: str | None,
+    *,
+    source_text: str = "",
+    quotes: list[str] | None = None,
 ) -> str:
-    """complete | weak | missing | unverified。
+    """complete | weak | missing | unverified | not_applicable。
 
-    关键条目如果带了原文锚点，而提取文里找不到锚点，不能被语义 complete 放行。
+    关键锚点可以用同一段中的原文引文或通用风险类的等价表述证明已保留。
+    纯占位符不计入缺失。没有这些证据时，关键项不能被语义 complete 放行。
     """
-    local = _anchor_status(item, extract_text)
+    texts = [item.statement, *item.anchors]
+    if texts and all(is_placeholder_only(text) for text in texts if str(text).strip()):
+        return "not_applicable"
+    local = _anchor_status(item, extract_text, source_text=source_text, quotes=quotes)
+    if local == "not_applicable":
+        return "not_applicable"
+    if local == "complete":
+        return "complete" if reported != "weak" else "weak"
     if item.is_critical and local == "missing":
         return "missing"
     if reported in ("complete", "weak", "missing"):
@@ -355,6 +423,8 @@ def evaluate_completeness(
     extract_text: str | None = None,
     threshold: float = PASS_COVERAGE_THRESHOLD,
     source: str = "not_run",
+    source_text: str = "",
+    quotes: list[str] | None = None,
 ) -> dict:
     total = len(items)
     if not executed:
@@ -372,13 +442,15 @@ def evaluate_completeness(
             "per_item": [],
         }
 
-    counts = {"complete": 0, "weak": 0, "missing": 0, "unverified": 0}
+    counts = {"complete": 0, "weak": 0, "missing": 0, "unverified": 0, "not_applicable": 0}
     per_item: list[dict] = []
     critical_missing: list[dict] = []
     for item in items:
         row = verify_by_id.get(item.id) or {}
         reported = str(row.get("status") or "").lower() or None
-        status = resolve_item_status(item, reported, extract_text)
+        status = resolve_item_status(
+            item, reported, extract_text, source_text=source_text, quotes=quotes,
+        )
         counts[status] = counts.get(status, 0) + 1
         record = {
             "id": item.id,
@@ -400,6 +472,7 @@ def evaluate_completeness(
 
     verified = counts["complete"] + counts["weak"] + counts["missing"]
     coverage = None
+    # 占位符不进入覆盖率分母。清单 total 仍是全部条目数。
     if verified and counts["unverified"] == 0:
         coverage = (counts["complete"] + 0.5 * counts["weak"]) / verified * 100
 
@@ -426,6 +499,7 @@ def evaluate_completeness(
         "weak": counts["weak"],
         "missing": counts["missing"],
         "unverified": counts["unverified"],
+        "not_applicable": counts["not_applicable"],
         "total": total,
         "source": source,
         "per_item": per_item,
@@ -437,10 +511,8 @@ def evaluate_completeness(
 # ---------------------------------------------------------------------------
 
 def quote_in_source(quote: str, source_text: str) -> bool:
-    needle = norm_ws(quote)
-    if len(needle) < 8 or not source_text:
-        return False
-    return needle in norm_ws(source_text)
+    from skillmind.fidelity import quote_in_source as _quote_in_source
+    return _quote_in_source(quote, source_text)
 
 
 def _rule_slots(rule: dict) -> dict[str, str]:
@@ -552,6 +624,27 @@ def evaluate_executability(
     else:
         source_support = GATE_UNKNOWN
 
+    faithfulness_values: list[str] = []
+    for rule in rules:
+        if _asserts_concrete(rule, ("action",)):
+            faithfulness_values.append(assess_faithfulness(str(rule.get("action") or ""), str(rule.get("source_quote") or "")))
+    for constraint in constraints:
+        if _asserts_concrete(constraint, ("statement",)):
+            faithfulness_values.append(
+                assess_faithfulness(str(constraint.get("statement") or ""), str(constraint.get("source_quote") or ""))
+            )
+    if not faithfulness_values:
+        faithfulness = GATE_UNKNOWN
+        reasons.append("faithfulness was not judged")
+    elif "FAIL" in faithfulness_values:
+        faithfulness = GATE_FAIL
+        reasons.append("action contradicts the source quote")
+    elif "UNKNOWN" in faithfulness_values:
+        faithfulness = GATE_UNKNOWN
+        reasons.append("quote presence does not prove the action is semantically faithful")
+    else:
+        faithfulness = GATE_PASS
+
     seen: set[str] = set()
     duplicate = False
     for rule in rules:
@@ -566,7 +659,7 @@ def evaluate_executability(
     if duplicate:
         reasons.append("duplicate rules")
 
-    parts = (structure, source_support, duplication)
+    parts = (structure, source_support, duplication, faithfulness)
     if GATE_FAIL in parts:
         status = GATE_FAIL
     elif GATE_UNKNOWN in parts:
@@ -578,6 +671,7 @@ def evaluate_executability(
         "structure": structure,
         "source_support": source_support,
         "duplication": duplication,
+        "faithfulness": faithfulness,
         "reasons": reasons,
     }
 
@@ -604,6 +698,8 @@ def build_audit_summary(
     prompt_version: str,
     schema_version: str,
     quality_current: bool,
+    hallucination_checked: bool = False,
+    hallucination_count: int | None = None,
 ) -> dict:
     """对外 JSON。保留 coverage / verdict / missing / needs_human_review。"""
     verdict = combine_gate_status(completeness.get("status", GATE_UNKNOWN), executability.get("status", GATE_UNKNOWN))
@@ -664,8 +760,14 @@ def build_audit_summary(
             "structure": executability.get("structure", GATE_UNKNOWN),
             "source_support": executability.get("source_support", GATE_UNKNOWN),
             "duplication": executability.get("duplication", GATE_UNKNOWN),
+            "faithfulness": executability.get("faithfulness", GATE_UNKNOWN),
             "reasons": list(executability.get("reasons") or []),
         },
+        "hallucination": {
+            "checked": bool(hallucination_checked),
+            "count": hallucination_count if hallucination_checked else None,
+        },
+        "quality_current_scope": "schema_identity_only",
         "counts": counts,
         "checklist": checklist_block,
         "checklist_source": checklist_source,
