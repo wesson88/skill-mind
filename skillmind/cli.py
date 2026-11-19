@@ -263,11 +263,16 @@ def extract(
         console.print(f"[red]未找到匹配的缓存文件[/red]")
         raise typer.Exit(1)
 
-    # 默认只处理没有当前版本 extract_cache 的文档
+    # Skill results require complete canonical caches, not merely existing files.
     if not rerun_all and not skill:
+        from skillmind.distillation import has_reusable_distillation_cache
         pending = [
             c for c in cached
-            if not _extract_cache_path(c.get("source_hash", ""), CURRENT_PROMPT_VERSION).exists()
+            if not (
+                has_reusable_distillation_cache(c.get("source_hash", ""), cfg)
+                if c.get("doc_type", "skill") == "skill"
+                else _extract_cache_path(c.get("source_hash", ""), CURRENT_PROMPT_VERSION).exists()
+            )
         ]
         skipped = len(cached) - len(pending)
         if skipped:
@@ -304,11 +309,14 @@ def extract(
                 console.print(f"  [red]✗ 缓存文件不存在，请重新 ingest:[/red] {label[:50]}")
                 fail += 1
                 continue
-            drafts = _extract(raw_path=raw_path, source_info=info, cfg=cfg, console=console)
+            drafts = _extract(raw_path=raw_path, source_info=info, cfg=cfg, console=console, force=rerun_all)
             total_cards += len(drafts)
             if auto_approve:
                 from skillmind.reviewer import save_draft
                 for d in drafts:
+                    if d.get("extract_complete", True) is not True:
+                        console.print("  [yellow]提取不完整，保持待审，未自动批准[/yellow]")
+                        continue
                     d["status"] = "approved"
                     save_draft(d)
             for d in drafts:
@@ -858,14 +866,10 @@ def audit(
     max_extracts: int = typer.Option(20, "--max-extracts", help="最多审计的提取笔记数（一文多卡时）"),
     vault_skills: Optional[str] = typer.Option(None, "--vault-skills", help="覆盖 vault skills 目录路径"),
 ):
-    """🔬 覆盖率审计:原文 vs vault 提取卡片(逐条 verbatim 对齐)
+    """🔬 Skill 语义审计：原文覆盖、主张来源支持、知识重组分别核验。
 
-    流程:
-        Pass 1 — LLM 从原文按章节抽出可验证条目(items)
-        Pass 2 — LLM 对每条 vs 抽取卡片,标 complete / weak / missing + verbatim
-        规则 — 数字 / wikilink 反查(幻觉)+ 跨卡重复(多卡时)
-
-    verdict:coverage ≥ 90% → PASS(自动放行) / < 90% → FAIL(需人工 review)
+    Skill 必须有当前语义证据；旧笔记、证据失效或未完成核验为 UNKNOWN。
+    覆盖率只展示，不单独放行。非 Skill 文档沿用旧覆盖审计。
 
     示例:
       skillmind audit a1b2c3d                  # 终端 summary
@@ -879,12 +883,18 @@ def audit(
     cfg = load_config()
 
     try:
-        with console.status(f"[cyan]正在审计 {source}...[/cyan]", spinner="dots"):
+        if json_output or json_detailed:
             report = audit_source(
-                source, cfg, console=console,
-                max_extract_files=max_extracts,
+                source, cfg, console=None, max_extract_files=max_extracts,
                 vault_skills_override=vault_skills,
             )
+        else:
+            with console.status(f"[cyan]正在审计 {source}...[/cyan]", spinner="dots"):
+                report = audit_source(
+                    source, cfg, console=console,
+                    max_extract_files=max_extracts,
+                    vault_skills_override=vault_skills,
+                )
     except Exception as e:
         console.print(f"[red]✗ 审计失败:[/red] {e}")
         raise typer.Exit(1)
@@ -904,31 +914,41 @@ def audit(
     # ---- 终端 JSON 完整输出 ----
     if json_detailed:
         import json as _json
-        console.print(_json.dumps(report.to_detailed_dict(), ensure_ascii=False, indent=2))
+        typer.echo(_json.dumps(report.to_detailed_dict(), ensure_ascii=False, indent=2))
         return
 
     if json_output:
         import json as _json
-        console.print(_json.dumps(report.to_summary_dict(), ensure_ascii=False, indent=2))
+        typer.echo(_json.dumps(report.to_summary_dict(), ensure_ascii=False, indent=2))
         return
 
     # ---- 终端 summary ----
     verdict_label = {
         "PASS": "[bold green]✅ PASS[/bold green]",
         "FAIL": "[bold red]❌ FAIL[/bold red]",
+        "UNKNOWN": "[bold yellow]❓ UNKNOWN[/bold yellow]",
     }.get(report.verdict, report.verdict)
-    color = {"PASS": "green", "FAIL": "red"}.get(report.verdict, "white")
+    color = {"PASS": "green", "FAIL": "red", "UNKNOWN": "yellow"}.get(report.verdict, "white")
+    coverage_text = "未测" if report.coverage_weighted is None else f"{report.coverage_weighted:.1f}%"
+    dimensions = ""
+    if hasattr(report, "synthesis_status"):
+        dimensions = (
+            f"原文台账: {report.source_inventory_status}  "
+            f"覆盖: {report.coverage_status}  来源支持: {report.support_status}  "
+            f"提炼质量: {report.synthesis_status}\n"
+        )
 
     summary = (
         f"原文: {report.source_title[:60]}\n"
         f"extract 卡片: {len(report.extract_files)} 张  原文: {report.original_chars:,} 字符  hash: {report.source_hash[:12]}...\n"
         f"Pass 1: {report.pass1_elapsed:.0f}s  Pass 2: {report.pass2_elapsed:.0f}s\n\n"
-        f"覆盖率: [bold {color}]{report.coverage_weighted:.1f}%[/bold {color}]  "
+        f"覆盖率: [bold {color}]{coverage_text}[/bold {color}]  "
         f"missing: {len(report.missing)} 条\n"
+        f"{dimensions}"
         f"verdict: {verdict_label}\n"
         f"needs_human_review: {report.needs_human_review}"
     )
-    console.print(Panel(summary, title="[bold]覆盖率审计[/bold]", border_style=color))
+    console.print(Panel(summary, title="[bold]知识审计[/bold]", border_style=color))
 
     if report.missing:
         console.print(f"\n[bold red]缺失项 ({len(report.missing)}):[/bold red]")

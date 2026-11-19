@@ -72,7 +72,8 @@ def _safe_copy(src: Path, dest: Path) -> None:
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    # Hashes are computed from UTF-8 text bytes; Windows must not add CR bytes.
+    tmp.write_text(text, encoding="utf-8", newline="")
     tmp.replace(path)
 
 
@@ -230,7 +231,7 @@ def _cache_web_document(
     else:
         # 旧条目；若文件被外部删了，重新落盘
         existing_path = Path(hashes[sha].get("raw_path", str(raw_dest)))
-        if not existing_path.exists():
+        if not existing_path.exists() or _sha256_file(existing_path) != sha:
             _atomic_write_text(existing_path, content)
 
     info = dict(hashes[sha])
@@ -261,11 +262,13 @@ def _ingest_single_raw_url(raw_url: str, *, source_url: str, source_repo: str,
             console.print(f"  [yellow]⟳ 已存在（内容未变），跳过:[/yellow] {raw_url.split('/')[-1]}")
         h = hashes[sha]
         raw_dest = Path(h.get("raw_path") or str(RAW_DIR / sha[:2] / f"{sha}.md"))
-        return [{**h, "source_hash": sha, "raw_path": str(raw_dest)}]
+        if not raw_dest.exists() or _sha256_file(raw_dest) != sha:
+            _atomic_write_text(raw_dest, content)
+        return [{**h, "source_hash": sha, "raw_path": str(raw_dest), "skipped": True}]
 
     raw_dest = RAW_DIR / sha[:2] / f"{sha}.md"
     raw_dest.parent.mkdir(parents=True, exist_ok=True)
-    raw_dest.write_text(content, encoding="utf-8")
+    _atomic_write_text(raw_dest, content)
 
     # 从 raw_url 解析 source_path
     # raw.githubusercontent.com/owner/repo/branch/path/SKILL.md
@@ -289,7 +292,7 @@ def _ingest_single_raw_url(raw_url: str, *, source_url: str, source_repo: str,
 
     if console:
         console.print(f"  [green]✓ 已缓存:[/green] {source_path}")
-    return [{**entry, "source_hash": sha}]
+    return [{**entry, "source_hash": sha, "skipped": False}]
 
 
 def ingest_skill(source: str, console=None) -> list[dict]:

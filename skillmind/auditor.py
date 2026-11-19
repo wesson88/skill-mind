@@ -700,6 +700,12 @@ def audit_source(
     cfg = cfg or load_config()
 
     full_hash, source_info = _resolve_source(source_hash)
+    if source_info.get("doc_type", "skill") == "skill":
+        from skillmind.semantic_auditor import audit_semantic_source
+        return audit_semantic_source(
+            full_hash, cfg, console=console, max_extract_files=max_extract_files,
+            vault_skills_override=vault_skills_override,
+        )
     raw_text = _read_raw_text(source_info)
     if not raw_text.strip():
         raise RuntimeError(f"原文为空:{source_info.get('raw_path', '')}")

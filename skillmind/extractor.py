@@ -215,6 +215,8 @@ def extract_skill(
     source_info: dict,
     cfg: dict,
     console=None,
+    *,
+    force: bool = False,
 ) -> list[dict]:
     """
     对单个已缓存文档执行提取，返回草稿列表（已写盘）。
@@ -231,6 +233,9 @@ def extract_skill(
         可选输出。
     """
     ensure_dirs()
+    if source_info.get("doc_type", "skill") == "skill":
+        from skillmind.distillation import distill_skill
+        return distill_skill(raw_path, source_info, cfg, console=console, force=force)
 
     raw_p = Path(raw_path)
     if not raw_p.exists():
@@ -247,7 +252,7 @@ def extract_skill(
     text = _read_text_auto(raw_p)
 
     # 2. 提取缓存命中（同一 hash + prompt 版本）
-    cached_units = _load_extract_cache(source_hash, prompt_version)
+    cached_units = None if force else _load_extract_cache(source_hash, prompt_version)
     if cached_units is not None:
         if console:
             console.print("  [dim]提取缓存命中，跳过 LLM 调用[/dim]")

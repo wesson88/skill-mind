@@ -2,7 +2,19 @@
 
 **开源 Claude Code Skill 知识提炼系统**
 
-将分散在 GitHub 上的 `SKILL.md` 文件，通过 LLM 提炼为结构化知识，沉淀为可供 Obsidian 直接使用的 Markdown 笔记。
+将 GitHub 上的 `SKILL.md` 提炼为可复用的知识与方法，保存为 Obsidian 笔记或 Agent Skill。Skill 提取采用“来源台账 → 跨章节重组 → 双向语义审计”，保留原理、理由、步骤、示例教训、例外与依赖，避免逐章英译中、照抄和无依据扩写。
+
+## 2.5.0：语义提炼
+
+- Skill 使用封闭结构 `semantic_distillation_v1`，提取提示词升级为 `extract_v11`，避开旧版和已废弃分支的缓存身份。其他来源类型暂沿用原有提取行为。
+- 最终正文可重新组织标题、合并跨章节的知识，不要求每个原章节都变成一段解释，也不强迫概念知识变成执行规则。必要命令、参数、数值保真，正文不反复附原文引句。
+- 来源片段、内容要点、正文与来源的映射单独保存；未覆盖项必须声明。映射只证明关联存在，不代替语义支持核验。
+- `audit` 分别检查台账是否漏掉原文、原文内容是否覆盖、产物主张是否有来源支持、正文是否真正重组提炼。Skill 不再凭某个覆盖率百分数放行；模型未完成、证据失效或不确定时返回 `UNKNOWN`，明确缺失/杜撰/仅复述则 `FAIL`。
+- 完整、有效且参数一致的结果才能复用缓存。模型、生成参数、prompt/schema 变化会使旧结果失效；`extract --all` 强制重新请求。不完整结果不会自动批准。
+
+发布的 Markdown 旁有同名 `.evidence.json`，记录规范数据与实际文件 SHA256；两种格式都保留该证据。审计直接读取 JSON，不从 Markdown 反引号中猜原文。编辑 Markdown 后旧证据不再匹配，需要从审阅后的规范草稿重新发布；旧 Skill 笔记没有当前证据时审计为 `UNKNOWN`。
+
+提取的默认资源预算继承 main 原实现：每批 12000 字符、请求超时 120 秒、最多 2 次重试、输出上限 16384 token、温度 0.2；审计继承 180 秒与 32768 输出 token。它们是请求预算，不是内容质量阈值，可通过 `llm` / `llm_profiles.extract` / `llm_profiles.audit` 中的 `batch_chars_per_request`、`timeout`、`max_retries`、`max_tokens`、`temperature` 调整。推理 token 可能占用输出预算，截断不会被修补成完整成功。展示覆盖率的 weak 权重 0.5 继承旧审计公式，仅作信息展示。
 
 ---
 
@@ -53,10 +65,10 @@ skillmind config --vault ~/Documents/ObsidianVault
 
 ```bash
 # 从 Git 仓库采集
-skillmind ingest https://github.com/anthropics/claude-code-skills
+skillmind ingest skill https://github.com/anthropics/claude-code-skills
 
 # 从本地目录采集
-skillmind ingest ~/my-skills-collection
+skillmind ingest skill ~/my-skills-collection
 ```
 
 ### 2. 提取知识

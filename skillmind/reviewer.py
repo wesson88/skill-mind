@@ -122,4 +122,7 @@ def validate_draft(data: dict) -> list[str]:
         errors.append("缺少 meta.name")
     if not data.get("source", {}).get("source_hash"):
         errors.append("缺少 source.source_hash")
+    if data.get("schema_version") == "semantic_distillation_v1":
+        from skillmind.distillation import validate_distillation
+        errors.extend(validate_distillation(data.get("distillation")))
     return errors

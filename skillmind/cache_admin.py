@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import shutil
+import json
 from pathlib import Path
 from typing import Iterable
 
@@ -37,6 +38,19 @@ from skillmind.reviewer import list_drafts
 # ---------------------------------------------------------------------------
 # 单源清理
 # ---------------------------------------------------------------------------
+
+def _source_extract_files(source_hash: str) -> list[Path]:
+    """Resolve both legacy filename identities and semantic envelope identities."""
+    files = set(EXTRACT_CACHE_DIR.glob(f"{source_hash}_*.json"))
+    for path in EXTRACT_CACHE_DIR.glob('*.semantic.json'):
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(record, dict) and record.get('source_hash') == source_hash:
+                files.add(path)
+        except (OSError, ValueError):
+            continue
+    return sorted(files)
+
 
 def cleanup_source(source_hash: str, console=None) -> dict:
     """删除某 source_hash 的 raw + extract_cache + 该来源的已发布草稿。
@@ -58,7 +72,7 @@ def cleanup_source(source_hash: str, console=None) -> dict:
             pass
 
     # 2. extract_cache 各阶段 / 各版本
-    for p in EXTRACT_CACHE_DIR.glob(f"{source_hash}_*.json"):
+    for p in _source_extract_files(source_hash):
         try:
             p.unlink()
             stats["extract_deleted"] += 1
@@ -196,7 +210,7 @@ def cleanup_orphans(console=None) -> dict:
             del hashes[sha]
             removed += 1
             # 顺便清相应 extract_cache（孤儿条目的 extract 也无用）
-            for p in EXTRACT_CACHE_DIR.glob(f"{sha}_*.json"):
+            for p in _source_extract_files(sha):
                 try:
                     p.unlink()
                 except OSError:

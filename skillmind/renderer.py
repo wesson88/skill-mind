@@ -9,7 +9,11 @@ v2.2 新增：
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -66,6 +70,98 @@ _DOC_TYPE_LABEL = {
 # Markdown 渲染
 # ---------------------------------------------------------------------------
 
+def _is_semantic(data: dict) -> bool:
+    return data.get("schema_version") == "semantic_distillation_v1"
+
+
+class _QuotedLink(str):
+    """A frontmatter link scalar whose quoting is part of the vault contract."""
+
+
+class _FrontmatterDumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_quoted_link(dumper: yaml.SafeDumper, value: str):
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style='"')
+
+
+_FrontmatterDumper.add_representer(_QuotedLink, _represent_quoted_link)
+
+
+def _render_semantic_sections(data: dict) -> list[str]:
+    """Render the canonical synthesis verbatim; evidence stays in its sidecar."""
+    lines: list[str] = []
+    for section in data["distillation"]["sections"]:
+        lines.extend([f"## {section['title']}", ""])
+        for item in section["items"]:
+            lines.extend([item["text"], ""])
+    return lines
+
+
+def _published_evidence_draft(data: dict) -> dict:
+    """Keep audit evidence without publishing machine-local cache provenance."""
+    draft = copy.deepcopy(data)
+    source = draft.get("source")
+    if isinstance(source, dict):
+        source.pop("raw_path", None)
+        repo = str(source.get("source_repo") or "")
+        if not re.match(r"^(?:(?:https?|ssh|git)://|[^/@:\s]+@[^/:\s]+:)", repo):
+            source.pop("source_repo", None)
+    return draft
+
+
+def _write_artifact_evidence(path: Path, data: dict) -> None:
+    """Atomically replace the envelope after hashing actual published bytes."""
+    envelope = {
+        "artifact_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "draft": _published_evidence_draft(data),
+    }
+    sidecar = path.with_suffix(".evidence.json")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=sidecar.parent,
+            prefix=sidecar.name + ".", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(envelope, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        temporary.replace(sidecar)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def load_artifact_evidence(path: str | Path) -> dict:
+    """Return the evidence envelope only when it matches the artifact's bytes.
+
+    This verifies publication integrity, not canonical schema validity or the
+    semantic truth of the draft. The semantic auditor performs those checks.
+    """
+    artifact = Path(path)
+    sidecar = artifact.with_suffix(".evidence.json")
+    try:
+        envelope = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Missing or invalid artifact evidence: {sidecar.name}") from exc
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != {"artifact_sha256", "draft"}
+        or not isinstance(envelope.get("draft"), dict)
+        or not isinstance(envelope.get("artifact_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", envelope["artifact_sha256"])
+    ):
+        raise ValueError(f"Invalid artifact evidence envelope: {sidecar.name}")
+    try:
+        actual_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError(f"Cannot verify artifact evidence: {artifact.name}") from exc
+    if envelope["artifact_sha256"] != actual_hash:
+        raise ValueError(f"Artifact evidence hash mismatch: {artifact.name}")
+    return envelope
+
+
 def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
     """将知识单元 dict 渲染为 Obsidian Markdown 字符串。"""
     cfg = cfg or load_config()
@@ -110,8 +206,11 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
 
     # 清理空值，减少噪声（注意：False 和 0 是合法值，不过滤）
     fm = {k: v for k, v in fm.items() if v is not None and v != "" and v != [] and v != {}}
+    for field in ("source_url", "source_repo", "parent_source"):
+        if field in fm:
+            fm[field] = _QuotedLink(fm[field])
 
-    fm_str = yaml.dump(fm, allow_unicode=True, default_flow_style=False).strip()
+    fm_str = yaml.dump(fm, Dumper=_FrontmatterDumper, allow_unicode=True, default_flow_style=False).strip()
     lines = [f"---\n{fm_str}\n---\n"]
 
     # --- 标题 ---
@@ -129,6 +228,11 @@ def render_to_markdown(data: dict, cfg: dict | None = None) -> str:
     # --- 一文多卡父文档链接 ---
     if card_total > 1 and source.get("parent_source"):
         lines.append(f"> 📎 父文档：[原始来源]({source['parent_source']})\n")
+
+    if _is_semantic(data):
+        lines.extend(_render_semantic_sections(data))
+        _render_source_footer(lines, source, doc_type)
+        return "\n".join(lines)
 
     # --- 一句话总结 ---
     if le.get("plain_summary"):
@@ -293,6 +397,42 @@ def _render_source_footer(lines: list[str], source: dict, doc_type: str) -> None
 # 发布到 Vault
 # ---------------------------------------------------------------------------
 
+def _owned_semantic_artifact(path: Path, uuid: str) -> bool:
+    """Ownership requires both the original artifact hash and matching UUID."""
+    if not uuid:
+        return False
+    try:
+        draft = load_artifact_evidence(path)["draft"]
+    except ValueError:
+        return False
+    return _is_semantic(draft) and draft.get("uuid") == uuid
+
+
+def _choose_obsidian_artifact(out: Path, stem: str, uuid: str) -> Path:
+    candidate = out / f"{stem}.md"
+    collision = 0
+    while candidate.exists() or candidate.with_suffix(".evidence.json").exists():
+        if _owned_semantic_artifact(candidate, uuid):
+            return candidate
+        suffix = _safe_filename(uuid[-7:])
+        serial = f"_{collision}" if collision else ""
+        candidate = out / f"{stem}_{suffix}{serial}.md"
+        collision += 1
+    return candidate
+
+
+def _retire_owned_obsidian_artifacts(out: Path, uuid: str, keep: Path) -> None:
+    """Retire generated siblings only after the replacement is fully written."""
+    for old in out.glob("*.md"):
+        if old == keep or not _owned_semantic_artifact(old, uuid):
+            continue
+        try:
+            old.unlink()
+            old.with_suffix(".evidence.json").unlink()
+        except OSError:
+            continue
+
+
 def publish_to_vault(
     data: dict,
     cfg: dict | None = None,
@@ -332,8 +472,12 @@ def publish_to_vault(
     filename = file_prefix + _safe_filename(meta_name) + ".md"
     dest = out / filename
 
-    # 文件名冲突时追加 uuid 后缀
-    if dest.exists():
+    # Semantic ownership comes from hash-bound evidence, never the filename.
+    semantic = _is_semantic(data)
+    uuid = str(data.get("uuid") or "")
+    if semantic:
+        dest = _choose_obsidian_artifact(out, file_prefix + _safe_filename(meta_name), uuid)
+    elif dest.exists():
         uid_short = data.get("uuid", "")[-7:]
         filename = file_prefix + _safe_filename(meta_name) + f"_{uid_short}.md"
         dest = out / filename
@@ -343,6 +487,9 @@ def publish_to_vault(
     tmp = dest.parent / (dest.name + ".tmp")
     tmp.write_text(md_content, encoding="utf-8")
     tmp.replace(dest)
+    _write_artifact_evidence(dest, data)
+    if semantic:
+        _retire_owned_obsidian_artifacts(out, uuid, keep=dest)
     return dest
 
 
@@ -439,6 +586,11 @@ def render_skill_markdown(data: dict, *, name: str | None = None) -> str:
     le = data.get("learning_enhancement") or {}
     lines = [f"---\n{fm}\n---\n", f"# {title}\n"]
 
+    if _is_semantic(data):
+        lines.extend(_render_semantic_sections(data))
+        _render_skill_source(lines, data, uuid)
+        return "\n".join(lines)
+
     summary = _one_line(le.get("plain_summary"))
     if summary:
         lines.append(summary)
@@ -520,13 +672,17 @@ def render_skill_markdown(data: dict, *, name: str | None = None) -> str:
             lines.append(f"- {item}")
         lines.append("")
 
+    _render_skill_source(lines, data, uuid)
+    return "\n".join(lines)
+
+
+def _render_skill_source(lines: list[str], data: dict, uuid: str) -> None:
     lines.append("## Source")
     lines.append("")
     lines.append(f"Distilled by SkillMind from {_source_label(data)}.")
     lines.append(f"SkillMind uuid: {uuid}")
     lines.append(f"<!-- skillmind-uuid: {_marker_uuid(uuid)} -->")
     lines.append("")
-    return "\n".join(lines)
 
 
 def _marker_uuid(uuid: str) -> str:
@@ -573,7 +729,19 @@ def _retire_other_owned(root: Path, uuid: str, keep: Path) -> None:
         if _skill_uuid_of(skill_file) != _marker_uuid(uuid):
             continue
         try:
+            sidecar = skill_file.with_suffix(".evidence.json")
+            try:
+                evidence = json.loads(sidecar.read_text(encoding="utf-8"))
+                owned_sidecar = (
+                    isinstance(evidence, dict)
+                    and isinstance(evidence.get("draft"), dict)
+                    and str(evidence["draft"].get("uuid")) == uuid
+                )
+            except (OSError, ValueError):
+                owned_sidecar = False
             skill_file.unlink()
+            if owned_sidecar:
+                sidecar.unlink()
             if not any(skill_file.parent.iterdir()):
                 skill_file.parent.rmdir()
         except OSError:
@@ -597,5 +765,6 @@ def publish_skill(data: dict, skill_dir: str | Path) -> Path:
     tmp = dest.with_suffix(".md.tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(dest)
+    _write_artifact_evidence(dest, data)
     _retire_other_owned(root, uuid, keep=dest_dir)
     return dest
