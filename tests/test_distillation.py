@@ -75,6 +75,11 @@ class DistillationContractTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_semantic_policy_version_does_not_invalidate_legacy_document_identity(self):
+        from skillmind import config
+        self.assertEqual(config.CURRENT_PROMPT_VERSION, 'extract_v11')
+        self.assertEqual(d.CURRENT_PROMPT_VERSION, 'extract_v12')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

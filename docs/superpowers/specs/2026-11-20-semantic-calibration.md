@@ -1,0 +1,18 @@
+# Semantic policy calibration
+
+The user approved repairing the three findings from the pinned mattpocock five-source run. Baseline is SkillMind 2.5.0/6353da9. Work locally on agent, preserve .claude and original validation artifacts, do not commit/push or write production data. Use the existing runtime and configuration, with credentials read only in memory.
+
+## Required behavior
+
+- Describe metadata intent as the source method's purpose and scope, not the distillation activity or its readers. Generic learner/agent-facing editorial phrasing alone is not an unsupported capability. Real new capabilities, use cases, preconditions or strengthened requirements must still fail. Preserve actual source audience restrictions when present.
+- Original name/identity need not be repeated in a standalone source-unit statement. Make frontmatter identity and its retained metadata locations explicit in the audit input. Full source spans remain authoritative; operational metadata (such as disable-model-invocation) and actual commands cannot be dismissed as decoration.
+- Preserve every independent condition, negation, exception and member of closed terminology/forbidden-term lists in inventory/synthesis. No forced source chapter layout or verbatim natural-language copying. The missing Module/unit constraint is a real negative control and must remain FAIL until restored.
+- Require grounded negative evidence in semantic audit v3. Counterexample is a closed object with exactly source_span_ids (nonempty list of actual namespaced source span IDs), source_quote (nonempty exact source excerpt), output_quote (actual candidate excerpt; may be empty only for missing coverage/inventory), explanation (nonempty mismatch description). Coverage negatives are grounded in their source unit's spans, claims in actual source plus the specific claim text, synthesis in source plus output, inventory gaps in their declared span. Quoting verifies evidence authenticity within each language; it is not cross-language verbatim alignment.
+- Invalid or absent negative evidence yields UNKNOWN for that judgment, never PASS. A separate well-evidenced FAIL still dominates incomplete dimensions. Preserve raw evaluation and validation reasons. No post-hoc string removal, per-repository allowlist, automatic PASS override or source-name special case.
+- Keep canonical semantic_distillation_v1 and public four-dimension/report interfaces compatible with SE 0.2. Audit identity becomes semantic_audit_v3; semantic extraction identity becomes extract_v12 while non-Skill document cache identity remains extract_v11. Template fingerprints still protect caches. Local package patch version 2.5.1 denotes these fixes, not remote publication.
+
+## Verification
+
+Offline RED→GREEN tests cover real missing terminology, unsupported capabilities/requirements, source audience restrictions, invalid/unanchored negative evidence, name retained outside inventory, operational metadata, exact IDs, mixed valid failures/incomplete judgments, cache identities and non-Skill compatibility. Use concrete test data and actual pipeline calls at provider boundaries, not only prompt substring assertions.
+
+Controlled real-model checks reuse the original five unmodified drafts/originals with the new auditor; retain codebase-design's original omission as an expected FAIL. Regenerate only codebase-design through the new extraction policy, then audit its preserved forbidden-term list. Preserve all first-run and new requests/responses/usage; do not reroll valid negative judgments. No claims of guaranteed deterministic model success. Test SE compatibility, independent code review, and record root cause/fix/evidence/remaining limitations in the vault.
