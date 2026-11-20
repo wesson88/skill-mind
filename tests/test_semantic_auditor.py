@@ -73,12 +73,147 @@ def test_complete_supported_concept_can_pass_without_executable_slots(audit_case
     assert report.to_detailed_dict()["semantic_evidence"]["source_gaps"] == []
 
 
+def witness(case, output=None):
+    span = case.draft['distillation']['source_spans'][-1]
+    return {'source_span_ids': ['skill-example:' + span['id']],
+            'source_quote': span['text'],
+            'output_quote': output if output is not None else case.draft['distillation']['sections'][0]['items'][0]['text'],
+            'explanation': 'Concrete source/output discrepancy.'}
+
+
+@pytest.mark.parametrize('defect', ['absent', 'string', 'source_quote', 'output_quote', 'span', 'extra_field'])
+def test_ungrounded_negative_is_unknown_not_fail_or_pass(audit_case, defect):
+    row = audit_case.response['claims'][0]
+    row.update(status='unsupported', reason='An alleged extra requirement.')
+    proof = witness(audit_case)
+    if defect == 'string':
+        proof = 'No source supports this.'
+    elif defect == 'source_quote':
+        proof['source_quote'] = 'fabricated source sentence'
+    elif defect == 'output_quote':
+        proof['output_quote'] = 'not present in this claim'
+    elif defect == 'span':
+        proof['source_span_ids'] = ['skill-example:missing']
+    elif defect == 'extra_field':
+        proof['confidence'] = 1
+    if defect != 'absent':
+        row['counterexample'] = proof
+    report = audit_case.run()
+    assert report.verdict == 'UNKNOWN'
+    assert report.support_status == 'UNKNOWN'
+    assert report.evaluation_errors
+
+
+def test_negative_proof_cannot_quote_another_claim(audit_case):
+    audit_case.response['claims'][0].update(status='unsupported', reason='Wrong claim cited.',
+                                          counterexample=witness(audit_case, 'Reusable knowledge'))
+    assert audit_case.run().verdict == 'UNKNOWN'
+
+
+def test_identity_is_explicit_without_inventing_inventory_units(audit_case):
+    from skillmind.distillation import parse_source_spans
+    draft = audit_case.draft
+    draft['distillation']['source_spans'] = parse_source_spans('---\nname: implement-spec\ndisable-model-invocation: true\n---\n\nDo the task.\n')
+    draft['meta']['trigger_keywords'] = ['implement-spec']
+    identity = audit_case.semantic._audit_payload([draft])[0]['source_identity']
+    assert identity['name'] == 'implement-spec'
+    assert 'meta.trigger_keywords' in identity['retained_in']
+    assert identity['other_frontmatter']['disable-model-invocation'] is True
+    assert len(draft['distillation']['source_units']) == 1
+
+
+def test_referenced_unit_does_not_hide_one_missing_forbidden_term(audit_case):
+    from skillmind.distillation import parse_source_spans
+    source = 'For Module, avoid unit, component, service.\n'
+    audit_case.raw.write_bytes(source.encode())
+    digest = hashlib.sha256(audit_case.raw.read_bytes()).hexdigest()
+    payload = audit_case.draft['distillation']
+    payload['source_spans'] = parse_source_spans(source)
+    payload['source_units'][0].update(statement=source.strip(), span_ids=['p0001'])
+    payload['sections'][0]['items'][0]['text'] = 'For Module, avoid component and service.'
+    audit_case.draft['source']['source_hash'] = digest
+    audit_case.response['coverage'][0].update(status='weak', reason='Module also forbids unit; that member is missing.', counterexample=witness(audit_case))
+    audit_case.save()
+    with patch('skillmind.auditor._resolve_source', return_value=(digest, {'source_hash': digest, 'raw_path': str(audit_case.raw), 'doc_type': 'skill'})):
+        report = audit_case.run()
+    assert report.coverage_status == 'FAIL'
+    assert report.verdict == 'FAIL'
+
+
+def test_coverage_witness_must_belong_to_its_unit(audit_case):
+    # Both span IDs and excerpts exist, but the title does not ground this unit.
+    audit_case.draft['distillation']['source_units'][0]['span_ids'] = [audit_case.draft['distillation']['source_spans'][-1]['id']]
+    audit_case.draft['distillation']['ignored_spans'] = [{'span_id': audit_case.draft['distillation']['source_spans'][0]['id'], 'reason': 'Heading only.'}]
+    proof = witness(audit_case)
+    first = audit_case.draft['distillation']['source_spans'][0]
+    proof.update(source_span_ids=['skill-example:' + first['id']], source_quote=first['text'])
+    audit_case.response['coverage'][0].update(status='weak', reason='Wrong source span cited.', counterexample=proof)
+    audit_case.save()
+    assert audit_case.run().coverage_status == 'UNKNOWN'
+
+
+def test_valid_inventory_failure_dominates_another_malformed_gap(audit_case):
+    gap = {'span_id': witness(audit_case)['source_span_ids'][0], 'statement': 'Assumptions not inventoried.',
+           'reason': 'Explicit source requirement.', 'counterexample': witness(audit_case, '')}
+    audit_case.response['source_gaps'] = [{'reason': 'Malformed'}, gap]
+    report = audit_case.run()
+    assert report.source_inventory_status == 'FAIL'
+    assert report.verdict == 'FAIL'
+    assert report.evaluation_errors
+
+
+@pytest.mark.parametrize('dimension', ['coverage', 'claims', 'synthesis'])
+def test_malformed_status_cannot_erase_an_independent_grounded_failure(audit_case, dimension):
+    audit_case.draft['meta']['intent'] = 'Deploy Kubernetes clusters.'
+    audit_case.save()
+    audit_case.response['claims'].append({'item_id': 'skill-example:meta.intent', 'status': 'unsupported',
+        'reason': 'Deployment is an unsupported new capability.', 'counterexample': witness(audit_case, 'Deploy Kubernetes clusters.')})
+    row = audit_case.response[dimension] if dimension == 'synthesis' else audit_case.response[dimension][0]
+    row['status'] = []
+    report = audit_case.run()
+    assert report.verdict == 'FAIL'
+    assert report.support_status == 'FAIL'
+
+
+@pytest.mark.parametrize('dimension', ['coverage', 'synthesis', 'source_gaps'])
+def test_every_negative_dimension_requires_a_grounded_counterexample(audit_case, dimension):
+    if dimension == 'coverage':
+        audit_case.response['coverage'][0].update(status='weak', reason='Alleged omission without evidence.')
+    elif dimension == 'synthesis':
+        audit_case.response['synthesis'].update(status='FAIL', reason='Alleged translation without evidence.')
+    else:
+        span = audit_case.draft['distillation']['source_spans'][-1]
+        audit_case.response['source_gaps'] = [{'span_id': 'skill-example:' + span['id'],
+            'statement': 'Alleged missing concept.', 'reason': 'No grounded excerpt.'}]
+    assert audit_case.run().verdict == 'UNKNOWN'
+
+
+def test_real_source_audience_restriction_cannot_be_discarded_as_editorial(audit_case):
+    from skillmind.distillation import parse_source_spans
+    source = 'This method applies only to licensed operators.\n'
+    audit_case.raw.write_bytes(source.encode())
+    digest = hashlib.sha256(audit_case.raw.read_bytes()).hexdigest()
+    payload = audit_case.draft['distillation']
+    payload['source_spans'] = parse_source_spans(source)
+    payload['source_units'][0].update(statement=source.strip(), span_ids=['p0001'])
+    audit_case.draft['source']['source_hash'] = digest
+    audit_case.draft['meta']['intent'] = 'For all learners without qualification.'
+    audit_case.response['claims'].append({'item_id': 'skill-example:meta.intent', 'status': 'unsupported',
+        'reason': 'The source restricts the audience to licensed operators.',
+        'counterexample': witness(audit_case, 'For all learners without qualification.')})
+    audit_case.save()
+    with patch('skillmind.auditor._resolve_source', return_value=(digest, {'source_hash': digest, 'raw_path': str(audit_case.raw), 'doc_type': 'skill'})):
+        assert audit_case.run().support_status == 'FAIL'
+
+
 @pytest.mark.parametrize("dimension", ["translation", "unsupported"])
 def test_nominal_full_coverage_does_not_override_negative_judgment(audit_case, dimension):
     if dimension == "translation":
-        audit_case.response["synthesis"] = {"status": "FAIL", "reason": "Chapter-by-chapter translation repeats the source instead of synthesis.", "counterexample": "skill-example:i1 restates source u1."}
+        audit_case.response["synthesis"] = {"status": "FAIL", "reason": "Chapter-by-chapter translation repeats the source instead of synthesis.", "counterexample": witness(audit_case)}
     else:
-        audit_case.response["claims"][0].update(status="unsupported", reason="The content adds a requirement absent from the source.", counterexample="skill-example:i1 adds a command absent from source u1.")
+        audit_case.draft['distillation']['sections'][0]['items'][0]['text'] += ' Run deploy now.'
+        audit_case.save()
+        audit_case.response["claims"][0].update(status="unsupported", reason="The content adds a requirement absent from the source.", counterexample=witness(audit_case, 'Run deploy now.'))
     report = audit_case.run()
     assert report.coverage_weighted == 100.0
     assert report.verdict == "FAIL"
@@ -140,7 +275,9 @@ def test_changed_actual_raw_source_is_unknown_even_when_metadata_matches(audit_c
 
 
 def test_explicit_weak_coverage_is_fail_and_legacy_weight_is_display_only(audit_case):
-    audit_case.response["coverage"][0].update(status="weak", reason="The applicable assumption is oversimplified.", counterexample="skill-example:i1 omits the condition in source u1.")
+    audit_case.draft['distillation']['sections'][0]['items'][0]['text'] = 'Knowledge can always be reused.'
+    audit_case.save()
+    audit_case.response["coverage"][0].update(status="weak", reason="The applicable assumption is oversimplified.", counterexample=witness(audit_case))
     report = audit_case.run()
     assert report.coverage_weighted == 50.0
     assert report.verdict == "FAIL"
@@ -158,7 +295,7 @@ def test_source_gap_fails_even_when_inventory_and_claims_look_complete(audit_cas
     spans = parse_source_spans(text)
     audit_case.draft["distillation"]["source_spans"] = spans
     audit_case.draft["distillation"]["source_units"][0]["span_ids"] = [s["id"] for s in spans]
-    audit_case.response["source_gaps"] = [{"span_id": "skill-example:" + spans[-1]["id"], "statement": "The exception limiting discarded assumptions is absent.", "reason": "The source's explicit exception has no output counterpart."}]
+    audit_case.response["source_gaps"] = [{"span_id": "skill-example:" + spans[-1]["id"], "statement": "The exception limiting discarded assumptions is absent.", "reason": "The source's explicit exception has no output counterpart.", 'counterexample': witness(audit_case, '')}]
     with patch("skillmind.auditor._resolve_source", return_value=(sha, {"source_hash": sha, "raw_path": str(audit_case.raw), "title": "Evidence"})):
         audit_case.save()
         report = audit_case.run()
@@ -223,7 +360,9 @@ def test_llm_call_uses_audit_profile_and_refuses_truncation(audit_case):
 
 
 def test_negative_dimension_still_visible_when_another_evaluation_is_missing(audit_case):
-    audit_case.response["claims"][0].update(status="unsupported", reason="The output adds a new condition.", counterexample="skill-example:i1 contains a condition absent from u1.")
+    audit_case.draft['distillation']['sections'][0]['items'][0]['text'] += ' Only reuse after deployment.'
+    audit_case.save()
+    audit_case.response["claims"][0].update(status="unsupported", reason="The output adds a new condition.", counterexample=witness(audit_case, 'Only reuse after deployment.'))
     audit_case.response.pop("synthesis")
     report = audit_case.run()
     assert report.verdict == "FAIL"
@@ -292,7 +431,7 @@ def test_extra_coverage_id_makes_coverage_dimension_unknown():
     from skillmind.auditor import SourceItem
     from skillmind.semantic_auditor import SemanticAuditReport, _evaluate
     report = SemanticAuditReport(source_hash="hash", source_title="Concept", source_path="source.md", items=[SourceItem(id="d:u", section="Concept", kind="concept", statement="Preserve rationale")])
-    draft = {"uuid": "d", "distillation": {"source_spans": [{"id": "p"}], "sections": [{"items": [{"id": "i"}]}]}}
+    draft = {"uuid": "d", "distillation": {"source_spans": [{"id": "p", "text": "Preserve rationale"}], "source_units": [{'id': 'u', 'span_ids': ['p']}], 'ignored_spans': [], 'uncovered': [], "sections": [{'id': 's', 'title': 'Concept', "items": [{"id": "i", 'text': 'Preserve rationale', 'source_ids': ['u']}]}]}}
     result = {"coverage": [{"source_id": "d:u", "status": "complete", "reason": "Rationale is preserved", "item_ids": ["d:i"]}, {"source_id": "extra", "status": "complete", "reason": "Invented id", "item_ids": ["d:i"]}], "claims": [{"item_id": "d:i", "status": "supported", "reason": "The source explicitly states this rationale"}], "synthesis": {"status": "PASS", "reason": "Useful conceptual synthesis"}, "source_gaps": []}
     _evaluate(report, result, [draft])
     assert report.verdict == "UNKNOWN"
@@ -407,7 +546,7 @@ def test_intent_only_change_is_a_required_source_support_claim(audit_case):
 def test_explicit_unsupported_intent_fails_with_full_body_coverage(audit_case):
     audit_case.draft["meta"]["intent"] = "Deploy Kubernetes clusters."
     audit_case.save()
-    audit_case.response["claims"].append({"item_id": "skill-example:meta.intent", "status": "unsupported", "reason": "Source only explains knowledge reuse; no deployment capability exists.", "counterexample": "meta.intent adds Kubernetes deployment absent from u1."})
+    audit_case.response["claims"].append({"item_id": "skill-example:meta.intent", "status": "unsupported", "reason": "Source only explains knowledge reuse; no deployment capability exists.", "counterexample": witness(audit_case, 'Deploy Kubernetes clusters.')})
     report = audit_case.run()
     assert report.verdict == "FAIL"
     assert report.support_status == "FAIL"

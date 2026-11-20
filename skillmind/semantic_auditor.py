@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from skillmind.config import get_vault_dir, load_config, resolve_llm_credentials
+from skillmind.audit_evidence import source_identity, valid_counterexample
 
-PROMPT_VERSION = "semantic_audit_v2"  # Adds published metadata to required support claims.
+PROMPT_VERSION = "semantic_audit_v3"  # Grounded negatives and explicit identity boundaries.
 WEAK_DISPLAY_WEIGHT = 0.5  # Legacy auditor's display weight; not a quality criterion.
 
 
@@ -101,6 +102,13 @@ Positive judgments must explain the source-to-content check performed.
 Published names, intents and trigger keywords are claims too: they must not add
 unsupported capabilities, tools or applicability. Names and section headings may
 abstract and reorganize source ideas; exact source wording is not required.
+Generic editorial references to learners or agents are not new functional scope.
+Fail actual new capabilities, use cases, prerequisites or changed audience restrictions.
+Original skill name is identity: preservation in raw provenance or metadata suffices;
+it need not become a standalone inventory statement or repeat in the Chinese title.
+Do not dismiss operational frontmatter (e.g. invocation flags) as identity decoration.
+Every independent member of a closed terminology/forbidden-term list matters:
+omitting one is a real coverage failure even if its parent unit is referenced.
 Coverage is semantic: illustrative commit hashes, fictional project identifiers,
 and dialogue wording need not be copied when the case's conditions, actions,
 outcomes, lesson and real behavioral constraints remain. Do not report purely
@@ -146,6 +154,7 @@ def _audit_payload(drafts: list[dict]) -> list[dict]:
         payload = draft["distillation"]
         records.append({
             "uuid": draft["uuid"],
+            "source_identity": source_identity(draft),
             "metadata_claims": _metadata_claims(draft),
             "source_spans": [{**s, "id": prefix + s["id"]} for s in payload["source_spans"]],
             "source_units": [{**u, "id": prefix + u["id"], "span_ids": [prefix + sid for sid in u["span_ids"]]} for u in payload["source_units"]],
@@ -177,8 +186,17 @@ def _call_semantic_audit(source_text: str, drafts: list[dict], cfg: dict) -> dic
         "claims:[{item_id,status:supported|unsupported|unknown,reason}], "
         "synthesis:{status:PASS|FAIL|UNKNOWN,reason}, "
         "source_gaps:[{span_id,statement,reason}]}.\n"
-        "For each negative/weak judgment add counterexample with actual source/item "
-        "locations and the concrete mismatch. Positive reason explains checks performed.\n"
+        "For EVERY weak/missing coverage, unsupported claim, FAIL synthesis and source_gap, "
+        "add counterexample with EXACTLY these fields: "
+        "{source_span_ids:[namespaced actual span id],source_quote:exact nonempty source excerpt,"
+        "output_quote:exact candidate excerpt,explanation:concrete semantic mismatch}. "
+        "source_span_ids must be unique and actual; source_quote must occur in a cited span. "
+        "Coverage witnesses must cite that unit's spans and referenced output items; "
+        "claim witnesses must quote that specific claim; gaps must cite their span_id. "
+        "Only missing coverage and source_gaps may use empty output_quote. "
+        "Synthesis witnesses must quote actual output. Never fabricate quotes. "
+        "If a judgment cannot be established, use unknown/UNKNOWN instead of unsupported or FAIL. "
+        "Positive reason explains checks performed.\n"
         "coverage must contain every expected source_id exactly once, claims every "
         "expected item_id exactly once. item_ids reference only expected output items.\n"
         "Include every metadata_claims id in claims alongside section content ids. "
@@ -287,7 +305,11 @@ def _evaluate(report: SemanticAuditReport, result: Any, drafts: list[dict]) -> N
     report.missing = []
     source_by_id = {it.id: it for it in report.items}
     item_ids = set(_claim_ids(drafts))
-    span_ids = {d["uuid"] + ":" + span["id"] for d in drafts for span in d["distillation"]["source_spans"]}
+    records = _audit_payload(drafts)
+    spans = {s['id']: s['text'] for d in records for s in d['source_spans']}
+    unit_spans = {u['id']: set(u['span_ids']) for d in records for u in d['source_units']}
+    outputs = {it['id']: it['text'] for d in records for sec in d['sections'] for it in sec['items']}
+    outputs.update({c['id']: c['text'] for d in records for c in d['metadata_claims']})
     errors = report.evaluation_errors
     before_coverage = len(errors)
     coverage = _rows_by_id(result.get("coverage"), set(source_by_id), "source_id", errors)
@@ -301,10 +323,16 @@ def _evaluate(report: SemanticAuditReport, result: Any, drafts: list[dict]) -> N
         status = row.get("status", "unknown")
         references = row.get("item_ids")
         valid_refs = isinstance(references, list) and all(isinstance(ref, str) and ref in item_ids for ref in references)
-        if status not in {"complete", "weak", "missing"} or not _has_text(row.get("reason")) or not valid_refs or (status in {"complete", "weak"} and not references):
+        if not isinstance(status, str) or status not in {"complete", "weak", "missing"} or not _has_text(row.get("reason")) or not valid_refs or (status in {"complete", "weak"} and not references):
             if row:
                 errors.append(f"{source_id}: invalid coverage judgment or evidence")
             status = "unknown"
+        if status in {'weak', 'missing'} and not valid_counterexample(
+            row.get('counterexample'), spans, [outputs[ref] for ref in references],
+            allowed_spans=unit_spans[source_id], allow_empty_output=status == 'missing'
+        ):
+            errors.append(f'{source_id}: invalid or absent coverage counterexample')
+            status = 'unknown'
         statuses.append(status)
         report.verify.append(VerifyResult(item_id=source_id, status=status, verbatim="", location=", ".join(references) if valid_refs else "", notes=row.get("reason", "") if _has_text(row.get("reason")) else "Unverified semantic coverage"))
         if status != "complete":
@@ -322,10 +350,13 @@ def _evaluate(report: SemanticAuditReport, result: Any, drafts: list[dict]) -> N
     for item_id in item_ids:
         row = claims.get(item_id, {})
         status = row.get("status", "unknown")
-        if status not in {"supported", "unsupported", "unknown"} or not _has_text(row.get("reason")):
+        if not isinstance(status, str) or status not in {"supported", "unsupported", "unknown"} or not _has_text(row.get("reason")):
             if row:
                 errors.append(f"{item_id}: invalid claim judgment or rationale")
             status = "unknown"
+        if status == 'unsupported' and not valid_counterexample(row.get('counterexample'), spans, [outputs[item_id]]):
+            errors.append(f'{item_id}: invalid or absent claim counterexample')
+            status = 'unknown'
         claim_statuses.append(status)
         if status == "unsupported":
             report.hallucinations.append({"category": "unsupported_claim", "item_id": item_id, "note": row["reason"], "evidence": row.get("counterexample", "")})
@@ -336,15 +367,27 @@ def _evaluate(report: SemanticAuditReport, result: Any, drafts: list[dict]) -> N
     if not claims_exact and report.support_status != "FAIL":
         report.support_status = "UNKNOWN"
     synthesis = result.get("synthesis")
-    if isinstance(synthesis, dict) and synthesis.get("status") in {"PASS", "FAIL", "UNKNOWN"} and _has_text(synthesis.get("reason")):
+    if isinstance(synthesis, dict) and isinstance(synthesis.get('status'), str) and synthesis.get("status") in {"PASS", "FAIL", "UNKNOWN"} and _has_text(synthesis.get("reason")):
         report.synthesis_status = synthesis["status"]
+        if report.synthesis_status == 'FAIL' and not valid_counterexample(synthesis.get('counterexample'), spans, list(outputs.values())):
+            errors.append('synthesis: invalid or absent counterexample')
+            report.synthesis_status = 'UNKNOWN'
     else:
         errors.append("synthesis: missing or malformed judgment/rationale")
     gaps = result.get("source_gaps")
-    if isinstance(gaps, list) and all(isinstance(gap, dict) and gap.get("span_id") in span_ids and _has_text(gap.get("statement")) and _has_text(gap.get("reason")) for gap in gaps):
-        report.source_inventory_status = "FAIL" if gaps else "PASS"
+    if isinstance(gaps, list):
+        report.source_inventory_status = 'PASS'
         for gap in gaps:
-            report.missing.append({"source_id": gap["span_id"], "section": "source inventory", "statement": gap["statement"], "reason": gap["reason"], "status": "missing"})
+            if (not isinstance(gap, dict) or not isinstance(gap.get('span_id'), str) or gap['span_id'] not in spans
+                or not _has_text(gap.get('statement')) or not _has_text(gap.get('reason'))
+                or not valid_counterexample(gap.get('counterexample'), spans, list(outputs.values()),
+                                            allowed_spans={gap['span_id']}, allow_empty_output=True)):
+                errors.append('source_gaps: invalid or absent source inventory counterexample')
+                if report.source_inventory_status != 'FAIL':
+                    report.source_inventory_status = 'UNKNOWN'
+            else:
+                report.source_inventory_status = 'FAIL'
+                report.missing.append({"source_id": gap["span_id"], "section": "source inventory", "statement": gap["statement"], "reason": gap["reason"], "status": "missing"})
     else:
         errors.append("source_gaps: missing or malformed source inventory check")
     dimensions = (report.coverage_status, report.support_status, report.synthesis_status, report.source_inventory_status)
