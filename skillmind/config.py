@@ -30,7 +30,7 @@ CONFIG_FILE = SKILLMIND_HOME / "config.yaml"
 EXTRACT_CACHE_DIR = CACHE_DIR / "extract_cache"
 
 CURRENT_PROMPT_VERSION = "extract_v11"
-SKILL_PROMPT_VERSION = "extract_v12"  # Semantic intent and independent-list retention.
+SKILL_PROMPT_VERSION = "extract_v14"  # Separate purpose and attribution before unit IDs are fixed.
 
 # ---------------------------------------------------------------------------
 # 确保目录存在

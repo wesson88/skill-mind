@@ -16,7 +16,7 @@ from typing import Any
 from skillmind.config import get_vault_dir, load_config, resolve_llm_credentials
 from skillmind.audit_evidence import source_identity, valid_counterexample
 
-PROMPT_VERSION = "semantic_audit_v3"  # Grounded negatives and explicit identity boundaries.
+PROMPT_VERSION = "semantic_audit_v5"  # Exclusions require whole-unit semantic evidence.
 WEAK_DISPLAY_WEIGHT = 0.5  # Legacy auditor's display weight; not a quality criterion.
 
 
@@ -44,6 +44,7 @@ class SemanticAuditReport:
     n_weak: int = 0
     n_missing: int = 0
     n_unverified: int = 0
+    n_excluded: int = 0
     n_supported: int = 0
     n_unsupported: int = 0
     n_claims_unknown: int = 0
@@ -74,6 +75,7 @@ class SemanticAuditReport:
             "n_weak": self.n_weak,
             "n_missing": self.n_missing,
             "n_unverified": self.n_unverified,
+            "n_excluded": self.n_excluded,
             "n_supported": self.n_supported,
             "n_unsupported": self.n_unsupported,
             "n_claims_unknown": self.n_claims_unknown,
@@ -83,7 +85,9 @@ class SemanticAuditReport:
         data = asdict(self)
         data["coverage_weight_provenance"] = (
             "Legacy skillmind.auditor display weighting: complete=1, weak=0.5, "
-            "missing=0; percentage is unmeasured when any source judgment is unknown. "
+            "missing=0; percentage evaluates method units, with excluded units counted "
+            "separately. It is unmeasured when any source judgment is unknown or any "
+            "exclusion is not independently justified. "
             "No numeric coverage threshold grants PASS."
         )
         return data
@@ -107,6 +111,21 @@ Fail actual new capabilities, use cases, prerequisites or changed audience restr
 Original skill name is identity: preservation in raw provenance or metadata suffices;
 it need not become a standalone inventory statement or repeat in the Chinese title.
 Do not dismiss operational frontmatter (e.g. invocation flags) as identity decoration.
+For v2, excluded records are candidate decisions, never semantic approval. Pure
+upstream credits, author/organization acknowledgments and attribution links do not
+belong in published title, intent, triggers, headings or body. Independently check
+every candidate exclusion against the full original: operational prerequisites,
+dependencies, purpose and invocation flags are method knowledge. A shared metadata
+span can contain both credits and method knowledge; a valid quote does not justify
+discarding the whole unit. Exclusion applies to the entire source_id statement,
+not just its source_quote. Read that full statement against the full original.
+If a unit mixes purpose, flags, prerequisites or other method knowledge with credits,
+it is not attribution_only and cannot be justified as excluded, even if its purpose
+also appears in another unit, source_identity or meta.intent. Duplicated retention
+does not repair an invalid whole-unit disposition. The unit's kind alone never
+determines eligibility. Classify mixed units as mixed and reject their exclusion.
+Check retained method units and missed source knowledge
+independently, including knowledge incorrectly classified as attribution.
 Every independent member of a closed terminology/forbidden-term list matters:
 omitting one is a real coverage failure even if its parent unit is referenced.
 Coverage is semantic: illustrative commit hashes, fictional project identifiers,
@@ -152,7 +171,7 @@ def _audit_payload(drafts: list[dict]) -> list[dict]:
     for draft in drafts:
         prefix = draft["uuid"] + ":"
         payload = draft["distillation"]
-        records.append({
+        record = {
             "uuid": draft["uuid"],
             "source_identity": source_identity(draft),
             "metadata_claims": _metadata_claims(draft),
@@ -161,8 +180,18 @@ def _audit_payload(drafts: list[dict]) -> list[dict]:
             "ignored_spans": [{**s, "span_id": prefix + s["span_id"]} for s in payload["ignored_spans"]],
             "sections": [{"id": prefix + s["id"], "title": s["title"], "items": [{**it, "id": prefix + it["id"], "source_ids": [prefix + uid for uid in it["source_ids"]]} for it in s["items"]]} for s in payload["sections"]],
             "uncovered": [{**u, "source_id": prefix + u["source_id"]} for u in payload["uncovered"]],
-        })
+        }
+        if _is_v2(draft):
+            record["excluded"] = [{**u, "source_id": prefix + u["source_id"],
+                                   "span_ids": [prefix + sid for sid in u["span_ids"]]}
+                                  for u in payload["excluded"]]
+        records.append(record)
     return records
+
+
+def _is_v2(draft: dict) -> bool:
+    from skillmind.distillation import SCHEMA_VERSION
+    return draft.get("schema_version") == SCHEMA_VERSION
 
 
 def _call_semantic_audit(source_text: str, drafts: list[dict], cfg: dict) -> dict:
@@ -179,8 +208,28 @@ def _call_semantic_audit(source_text: str, drafts: list[dict], cfg: dict) -> dic
     max_tokens = int(settings.get("max_tokens", 32768))
     retries = int(settings.get("max_retries", 2))
     records = _audit_payload(drafts)
-    expected_sources = [u["id"] for d in records for u in d["source_units"]]
+    expected_exclusions = [u["source_id"] for d in records for u in d.get("excluded", [])]
+    expected_sources = [u["id"] for d in records for u in d["source_units"]
+                        if u["id"] not in set(expected_exclusions)]
     expected_items = _claim_ids(drafts)
+    exclusion_protocol = (
+        "V2 additionally requires exclusions:[{source_id,status:justified|unjustified|unknown,"
+        "scope:whole_unit,unit_content:attribution_only|mixed|method|unknown,reason,counterexample?}] "
+        "and attribution_check:{status:PASS|FAIL|UNKNOWN,reason,counterexample?}. "
+        "These are closed objects: no other row/check fields are allowed. "
+        "exclusions must contain every expected exclusion id exactly once, even when the expected set is empty. "
+        "Independently verify the ENTIRE source unit; scope must be whole_unit, never source_quote. "
+        "Only attribution_only can be justified; mixed/method must not be justified. "
+        "If unit_content cannot be established, use unknown. A quote does not narrow the unit's scope. "
+        "Purpose retained elsewhere does not authorize excluding a mixed unit. "
+        "Operational flags, purpose, dependencies and mixed method knowledge must survive. "
+        "Unjustified exclusions require the same exact counterexample object, citing that unit's spans; "
+        "an actual omitted requirement may have empty output_quote. "
+        "attribution_check checks ALL published titles, intent, trigger keywords, section headings and content "
+        "for reintroduced upstream credits. FAIL requires an actual nonempty output quote. "
+        "Both checks affect source inventory, and neither replaces independent full-source gap detection.\n"
+        "Expected exclusion ids: " + json.dumps(expected_exclusions, ensure_ascii=False) + "\n"
+    ) if any(_is_v2(d) for d in drafts) else ""
     prompt = (
         "Return {coverage:[{source_id,status:complete|weak|missing,reason,item_ids:[]}], "
         "claims:[{item_id,status:supported|unsupported|unknown,reason}], "
@@ -207,6 +256,8 @@ def _call_semantic_audit(source_text: str, drafts: list[dict], cfg: dict) -> dic
         "Report all such omissions in source_gaps using namespaced source span ids. "
         "An ignored span reason is not proof that substantive content may be discarded. "
         "source_gaps must be present and [] only if no such omissions exist.\n"
+        + exclusion_protocol
+        +
         "Expected source ids: " + json.dumps(expected_sources, ensure_ascii=False) + "\n"
         "Expected item ids: " + json.dumps(expected_items, ensure_ascii=False) + "\n"
         "FULL ORIGINAL:\n" + source_text + "\nCANONICAL DRAFTS:\n" + json.dumps(records, ensure_ascii=False)
@@ -295,6 +346,81 @@ def _rows_by_id(value: Any, expected: set[str], key: str, errors: list[str]) -> 
     return {row[key]: row for row in value if isinstance(row, dict) and isinstance(row.get(key), str) and row[key] in expected and counts[row[key]] == 1}
 
 
+def _exclusion_checks(result: dict, records: list[dict], spans: dict[str, str],
+                      unit_spans: dict[str, set[str]], outputs: list[str],
+                      errors: list[str]) -> tuple[str, bool]:
+    """Validate v2 decisions; only a fully justified exact ledger reduces coverage."""
+    expected = {u["source_id"] for d in records for u in d.get("excluded", [])}
+    before = len(errors)
+    rows = _rows_by_id(result.get("exclusions"), expected, "source_id", errors)
+    exact = len(errors) == before
+    statuses = []
+    for source_id in sorted(expected):
+        row = rows.get(source_id, {})
+        status = row.get("status", "unknown")
+        if (not {"source_id", "status", "scope", "unit_content", "reason"} <= set(row)
+            or not set(row) <= {"source_id", "status", "scope", "unit_content", "reason", "counterexample"}
+            or not isinstance(status, str) or status not in {"justified", "unjustified", "unknown"}
+            or row.get("scope") != "whole_unit"
+            or not isinstance(row.get("unit_content"), str)
+            or row["unit_content"] not in {"attribution_only", "mixed", "method", "unknown"}
+            or not _has_text(row.get("reason"))):
+            errors.append(f"{source_id}: invalid exclusion judgment or rationale")
+            status = "unknown"
+        if status == "justified" and row.get("unit_content") != "attribution_only":
+            errors.append(f"{source_id}: exclusion is not verified as whole-unit attribution_only")
+            status = "unknown"
+        if status == "unjustified" and not valid_counterexample(
+            row.get("counterexample"), spans, outputs, allowed_spans=unit_spans[source_id],
+            allow_empty_output=True
+        ):
+            errors.append(f"{source_id}: invalid or absent exclusion counterexample")
+            status = "unknown"
+        statuses.append(status)
+    fully_justified = exact and all(status == "justified" for status in statuses)
+    exclusion_status = ("FAIL" if "unjustified" in statuses else
+                        "PASS" if fully_justified else "UNKNOWN")
+    attribution = result.get("attribution_check")
+    attribution_status = "UNKNOWN"
+    if (isinstance(attribution, dict)
+        and {"status", "reason"} <= set(attribution)
+        and set(attribution) <= {"status", "reason", "counterexample"}
+        and isinstance(attribution.get("status"), str)
+        and attribution["status"] in {"PASS", "FAIL", "UNKNOWN"}
+        and _has_text(attribution.get("reason"))):
+        attribution_status = attribution["status"]
+        if attribution_status == "FAIL" and not valid_counterexample(
+            attribution.get("counterexample"), spans, outputs
+        ):
+            errors.append("attribution_check: invalid or absent counterexample")
+            attribution_status = "UNKNOWN"
+    else:
+        errors.append("attribution_check: missing or malformed judgment/rationale")
+    return (_dimension([exclusion_status, attribution_status], complete="PASS", failures={"FAIL"}),
+            fully_justified)
+
+
+def validate_exclusion_approval(drafts: list[dict], semantic_evidence: dict) -> None:
+    """Check the v2 approval protocol without rejudging source semantics.
+
+    Consumers must not reuse older approvals whose quote-only decisions cannot
+    establish whole-unit eligibility. Historical stored verdicts remain intact.
+    """
+    if not any(_is_v2(d) for d in drafts):
+        return
+    if not isinstance(semantic_evidence, dict):
+        raise ValueError("Missing whole-unit exclusion approval evidence")
+    records = _audit_payload(drafts)
+    spans = {s['id']: s['text'] for d in records for s in d['source_spans']}
+    unit_spans = {u['id']: set(u['span_ids']) for d in records for u in d['source_units']}
+    outputs = [i['text'] for d in records for s in d['sections'] for i in s['items']]
+    outputs += [c['text'] for d in records for c in d['metadata_claims']]
+    errors: list[str] = []
+    status, justified = _exclusion_checks(semantic_evidence, records, spans, unit_spans, outputs, errors)
+    if status != "PASS" or not justified or errors:
+        raise ValueError("Incomplete or invalid whole-unit exclusion approval evidence")
+
+
 def _evaluate(report: SemanticAuditReport, result: Any, drafts: list[dict]) -> None:
     from skillmind.auditor import VerifyResult
 
@@ -303,14 +429,23 @@ def _evaluate(report: SemanticAuditReport, result: Any, drafts: list[dict]) -> N
         return
     report.semantic_evidence = result
     report.missing = []
-    source_by_id = {it.id: it for it in report.items}
+    excluded_ids = {d["uuid"] + ":" + u["source_id"] for d in drafts if _is_v2(d)
+                    for u in d["distillation"]["excluded"]}
+    report.n_excluded = len(excluded_ids)
+    source_by_id = {it.id: it for it in report.items if it.id not in excluded_ids}
     item_ids = set(_claim_ids(drafts))
     records = _audit_payload(drafts)
     spans = {s['id']: s['text'] for d in records for s in d['source_spans']}
     unit_spans = {u['id']: set(u['span_ids']) for d in records for u in d['source_units']}
     outputs = {it['id']: it['text'] for d in records for sec in d['sections'] for it in sec['items']}
     outputs.update({c['id']: c['text'] for d in records for c in d['metadata_claims']})
+    published_texts = list(outputs.values()) + [sec['title'] for d in records for sec in d['sections']]
     errors = report.evaluation_errors
+    exclusion_status, exclusions_justified = (
+        _exclusion_checks(result, records, spans, unit_spans, published_texts, errors)
+        if any(_is_v2(d) for d in drafts) else ("PASS", True)
+    )
+    report.coverage_weighted = None
     before_coverage = len(errors)
     coverage = _rows_by_id(result.get("coverage"), set(source_by_id), "source_id", errors)
     coverage_exact = len(errors) == before_coverage
@@ -341,7 +476,7 @@ def _evaluate(report: SemanticAuditReport, result: Any, drafts: list[dict]) -> N
     report.n_weak = statuses.count("weak")
     report.n_missing = statuses.count("missing")
     report.n_unverified = statuses.count("unknown")
-    if statuses and not report.n_unverified and coverage_exact:
+    if statuses and not report.n_unverified and coverage_exact and exclusions_justified:
         report.coverage_weighted = (report.n_complete + WEAK_DISPLAY_WEIGHT * report.n_weak) / len(statuses) * 100
     report.coverage_status = _dimension(statuses, complete="complete", failures={"weak", "missing"})
     if not coverage_exact and report.coverage_status != "FAIL":
@@ -390,6 +525,9 @@ def _evaluate(report: SemanticAuditReport, result: Any, drafts: list[dict]) -> N
                 report.missing.append({"source_id": gap["span_id"], "section": "source inventory", "statement": gap["statement"], "reason": gap["reason"], "status": "missing"})
     else:
         errors.append("source_gaps: missing or malformed source inventory check")
+    report.source_inventory_status = _dimension(
+        [report.source_inventory_status, exclusion_status], complete="PASS", failures={"FAIL"}
+    )
     dimensions = (report.coverage_status, report.support_status, report.synthesis_status, report.source_inventory_status)
     if "FAIL" in dimensions:
         report.verdict = "FAIL"
@@ -447,7 +585,7 @@ def audit_semantic_source(
     """
     from skillmind.auditor import AuditIssue, SourceItem, _resolve_source
     from skillmind.config import RAW_DIR
-    from skillmind.distillation import SCHEMA_VERSION, parse_source_spans, validate_distillation
+    from skillmind.distillation import SUPPORTED_SCHEMAS, parse_source_spans, validate_distillation
     from skillmind.parser import _read_text_auto
     from skillmind.renderer import load_artifact_evidence
 
@@ -480,8 +618,8 @@ def audit_semantic_source(
         for path in notes:
             envelope = load_artifact_evidence(Path(path))
             draft = envelope["draft"]
-            if draft.get("schema_version") != SCHEMA_VERSION:
-                raise ValueError("Artifact lacks the current canonical schema")
+            if draft.get("schema_version") not in SUPPORTED_SCHEMAS:
+                raise ValueError("Artifact lacks a supported canonical schema")
             if draft.get("source", {}).get("source_hash") != full_hash:
                 raise ValueError("Artifact source hash does not match actual source")
             if draft.get("extract_complete") is not True:
@@ -490,7 +628,7 @@ def audit_semantic_source(
             if not _has_text(uuid):
                 raise ValueError("Artifact uuid is missing")
             payload = draft.get("distillation")
-            validation_errors = validate_distillation(payload)
+            validation_errors = validate_distillation(payload, schema_version=draft["schema_version"])
             if validation_errors:
                 raise ValueError("Canonical evidence failed validation: " + "; ".join(validation_errors))
             if payload["source_spans"] != expected_spans:
@@ -512,7 +650,11 @@ def audit_semantic_source(
         for draft in drafts:
             prefix = draft["uuid"] + ":"
             spans = {s["id"]: s for s in draft["distillation"]["source_spans"]}
+            excluded = {u["source_id"] for u in draft["distillation"].get("excluded", [])}
+            report.n_excluded += len(excluded)
             for unit in draft["distillation"]["source_units"]:
+                if unit["id"] in excluded:
+                    continue
                 sections = list(dict.fromkeys(spans[span_id]["section"] for span_id in unit["span_ids"]))
                 report.items.append(SourceItem(id=prefix + unit["id"], section=" / ".join(sections), kind=unit["kind"], statement=unit["statement"]))
         if not report.items:
@@ -532,7 +674,7 @@ def audit_semantic_source(
                        "statement": item.statement, "reason": "Semantic evaluation has not verified this source unit",
                        "status": "unknown"} for item in report.items]
     if console:
-        console.print(f"  [cyan]Semantic audit: {len(report.items)} source units, {len(drafts)} canonical artifacts[/cyan]")
+        console.print(f"  [cyan]Semantic audit: {len(report.items)} method units, {report.n_excluded} excluded units, {len(drafts)} canonical artifacts[/cyan]")
     started = time.monotonic()
     try:
         result = _call_semantic_audit(text, drafts, cfg)

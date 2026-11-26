@@ -78,7 +78,7 @@ class PipelineTests(unittest.TestCase):
     def test_semantic_policy_version_does_not_invalidate_legacy_document_identity(self):
         from skillmind import config
         self.assertEqual(config.CURRENT_PROMPT_VERSION, 'extract_v11')
-        self.assertEqual(d.CURRENT_PROMPT_VERSION, 'extract_v12')
+        self.assertEqual(d.CURRENT_PROMPT_VERSION, 'extract_v14')
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -95,7 +95,7 @@ class PipelineTests(unittest.TestCase):
     def responses(self, uncovered=False):
         p = payload()
         inv = {'units': [{k: v for k, v in x.items() if k != 'id'} for x in p['source_units']], 'ignored_spans': []}
-        syn = {'meta': {'name': '受理规则', 'intent': '检查受理边界'}, 'sections': p['sections'], 'uncovered': []}
+        syn = {'meta': {'name': '受理规则', 'intent': '检查受理边界'}, 'sections': p['sections'], 'uncovered': [], 'excluded': []}
         if uncovered:
             syn['sections'][0]['items'][0]['source_ids'] = ['u0001']
             syn['uncovered'] = [{'source_id': 'u0002', 'reason': '尚未提炼'}]
