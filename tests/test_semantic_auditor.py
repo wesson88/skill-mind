@@ -17,14 +17,14 @@ def audit_case(tmp_path, monkeypatch):
     # Import inside fixture so the initial RED reports the missing implementation.
     semantic = importlib.import_module("skillmind.semantic_auditor")
     call_model = semantic._call_semantic_audit
-    from skillmind.distillation import SCHEMA_VERSION, parse_source_spans
+    from skillmind.distillation import LEGACY_SCHEMA_VERSION, parse_source_spans
     raw_text = "# Evidence\n\nKnowledge is reusable when its assumptions are preserved.\n"
     raw = tmp_path / "source.md"
     raw.write_bytes(raw_text.encode("utf-8"))
     sha = hashlib.sha256(raw.read_bytes()).hexdigest()
     spans = parse_source_spans(raw_text)
     draft = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": LEGACY_SCHEMA_VERSION,
         "uuid": "skill-example",
         "extract_complete": True,
         "source": {"source_hash": sha, "doc_type": "skill"},

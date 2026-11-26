@@ -71,7 +71,8 @@ _DOC_TYPE_LABEL = {
 # ---------------------------------------------------------------------------
 
 def _is_semantic(data: dict) -> bool:
-    return data.get("schema_version") == "semantic_distillation_v1"
+    from skillmind.distillation import SUPPORTED_SCHEMAS
+    return data.get("schema_version") in SUPPORTED_SCHEMAS
 
 
 class _QuotedLink(str):
